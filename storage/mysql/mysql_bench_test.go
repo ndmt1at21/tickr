@@ -44,8 +44,16 @@ func BenchmarkMySQLDrain(b *testing.B) {
 		b.Fatalf("sql.Open: %v", err)
 	}
 	b.Cleanup(func() { _ = db.Close() })
-	if err := db.PingContext(ctx); err != nil {
-		b.Fatalf("ping: %v", err)
+	// See mysql_integration_test.go for the rationale on the ping retry.
+	pingCtx, pingCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer pingCancel()
+	for {
+		if err := db.PingContext(pingCtx); err == nil {
+			break
+		} else if pingCtx.Err() != nil {
+			b.Fatalf("ping: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	store := mysqlstore.New(db)

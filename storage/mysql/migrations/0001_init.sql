@@ -36,8 +36,3 @@ CREATE TABLE tickr_history (
     at          DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     PRIMARY KEY (message_id, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-
-CREATE TABLE tickr_schema_version (
-    version    INT         NOT NULL PRIMARY KEY,
-    applied_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6)
-) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

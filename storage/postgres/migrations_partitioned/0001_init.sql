@@ -72,8 +72,3 @@ CREATE TABLE tickr_history (
     at          TIMESTAMPTZ  NOT NULL DEFAULT now(),
     PRIMARY KEY (message_id, seq)
 );
-
-CREATE TABLE tickr_schema_version (
-    version    INT         PRIMARY KEY,
-    applied_at TIMESTAMPTZ NOT NULL DEFAULT now()
-);

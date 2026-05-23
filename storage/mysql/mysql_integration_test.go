@@ -44,8 +44,18 @@ func TestMySQLSuite(t *testing.T) {
 		t.Fatalf("sql.Open: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
-	if err := db.PingContext(ctx); err != nil {
-		t.Fatalf("ping: %v", err)
+	// MySQL containers occasionally accept connections during the "temp
+	// init" → "real start" handover and then drop them with EOF; retry
+	// briefly until the server settles.
+	pingCtx, pingCancel := context.WithTimeout(ctx, 30*time.Second)
+	defer pingCancel()
+	for {
+		if err := db.PingContext(pingCtx); err == nil {
+			break
+		} else if pingCtx.Err() != nil {
+			t.Fatalf("ping: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
 	}
 
 	store := mysqlstore.New(db)
