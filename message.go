@@ -13,6 +13,7 @@ type MessageID string
 // Status is the lifecycle state of a message.
 type Status string
 
+// Lifecycle states. SUCCESS and DEAD are terminal; the others are transient.
 const (
 	StatusCreated  Status = "CREATED"
 	StatusHandling Status = "HANDLING"
@@ -90,6 +91,7 @@ type Transition struct {
 // Outcome categorises the result of a single handler attempt for metrics.
 type Outcome string
 
+// Handler-attempt outcomes used by the Metrics hook.
 const (
 	OutcomeSuccess  Outcome = "success"
 	OutcomeRetry    Outcome = "retry"

@@ -59,7 +59,7 @@ func (e ExponentialBackoff) NextDelay(attempt int, _ error) time.Duration {
 	}
 
 	if jitter > 0 {
-		r := 0.5
+		var r float64
 		if e.Rand != nil {
 			r = e.Rand()
 		} else {

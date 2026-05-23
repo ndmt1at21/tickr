@@ -106,7 +106,7 @@ func handleOrderCreated(pool *pgxpool.Pool, client *tickr.Client) jsoncodec.Hand
 				body.OrderID); err != nil {
 				return err
 			}
-			payload, _ := jsoncodec.Encode(PaymentCharge{OrderID: body.OrderID})
+			payload, _ := jsoncodec.Encode(PaymentCharge(body))
 			_, err := client.Enqueue(ctx, pgstore.WrapTx(tx), tickr.Message{
 				Type:           "payment.charge",
 				Payload:        payload,
@@ -136,7 +136,7 @@ func handlePaymentCharge(pool *pgxpool.Pool, client *tickr.Client) jsoncodec.Han
 			if _, err := tx.Exec(ctx, `UPDATE orders SET status='paid', updated_at=now() WHERE id=$1`, body.OrderID); err != nil {
 				return err
 			}
-			payload, _ := jsoncodec.Encode(ShipmentCreate{OrderID: body.OrderID})
+			payload, _ := jsoncodec.Encode(ShipmentCreate(body))
 			_, err := client.Enqueue(ctx, pgstore.WrapTx(tx), tickr.Message{
 				Type:           "shipment.create",
 				Payload:        payload,

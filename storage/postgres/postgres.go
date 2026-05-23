@@ -309,7 +309,7 @@ func (s *Store) EnqueueBatch(ctx context.Context, tx tickr.Tx, ps []tickr.Enqueu
 			idemArg, maxAttempts, processAt)
 	}
 	br := q.SendBatch(ctx, batch)
-	defer br.Close()
+	defer func() { _ = br.Close() }()
 
 	out := make([]*tickr.InboundMessage, 0, len(ps))
 	var firstErr error
@@ -389,6 +389,7 @@ FROM   eligible e
 WHERE  m.id = e.id
 RETURNING ` + messageReturnCols
 
+// Claim implements tickr.Storage.
 func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.InboundMessage, error) {
 	if p.Batch <= 0 {
 		p.Batch = 1
@@ -446,6 +447,7 @@ WHERE  id = $1
   AND  status = 'HANDLING'
   AND  attempt = $2`
 
+// Succeed implements tickr.Storage.
 func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, workerID string) error {
 	mid, err := uuid.Parse(string(id))
 	if err != nil {
@@ -486,6 +488,7 @@ WHERE  id = $1
   AND  status = 'HANDLING'
   AND  attempt = $2`
 
+// Fail implements tickr.Storage.
 func (s *Store) Fail(ctx context.Context, p tickr.FailParams) error {
 	mid, err := uuid.Parse(string(p.MessageID))
 	if err != nil {
@@ -528,6 +531,7 @@ WHERE  id = $1
   AND  status = 'HANDLING'
   AND  attempt = $2`
 
+// ReleaseShutdown implements tickr.Storage.
 func (s *Store) ReleaseShutdown(ctx context.Context, id tickr.MessageID, attempt int, workerID, reason string) error {
 	mid, err := uuid.Parse(string(id))
 	if err != nil {
@@ -551,6 +555,7 @@ WHERE  id = $1
   AND  status = 'HANDLING'
   AND  claimed_by = $2`
 
+// Extend implements tickr.Storage.
 func (s *Store) Extend(ctx context.Context, id tickr.MessageID, workerID string, until time.Time) (bool, error) {
 	mid, err := uuid.Parse(string(id))
 	if err != nil {
@@ -601,7 +606,7 @@ func (s *Store) appendHistoryBatch(ctx context.Context, msgs []*tickr.InboundMes
 		batch.Queue(appendHistorySQL, mid, nil, string(to), m.Attempt, errStr, workerID)
 	}
 	br := s.pool.SendBatch(ctx, batch)
-	defer br.Close()
+	defer func() { _ = br.Close() }()
 	for range msgs {
 		if _, err := br.Exec(); err != nil {
 			return err
@@ -616,6 +621,7 @@ FROM   tickr_history
 WHERE  message_id = $1
 ORDER BY seq`
 
+// History implements tickr.Storage.
 func (s *Store) History(ctx context.Context, id tickr.MessageID) ([]tickr.Transition, error) {
 	mid, err := uuid.Parse(string(id))
 	if err != nil {
@@ -673,6 +679,7 @@ WHERE  status = 'DEAD'
 ORDER BY completed_at DESC
 LIMIT  $3`
 
+// ListDead implements tickr.Storage.
 func (s *Store) ListDead(ctx context.Context, eventType string, after time.Time, limit int) ([]*tickr.InboundMessage, error) {
 	if limit <= 0 {
 		limit = 100
@@ -703,6 +710,7 @@ SET    status        = 'CREATED',
        updated_at    = now()
 WHERE  id = $1 AND status = 'DEAD'`
 
+// Requeue implements tickr.Storage.
 func (s *Store) Requeue(ctx context.Context, id tickr.MessageID, processAt time.Time) error {
 	mid, err := uuid.Parse(string(id))
 	if err != nil {
@@ -739,6 +747,7 @@ WHERE  id IN (
 )
 RETURNING 1`
 
+// ReclaimExpired implements tickr.Storage.
 func (s *Store) ReclaimExpired(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 500
@@ -759,6 +768,7 @@ WHERE id IN (
     LIMIT  $2
 )`
 
+// PurgeTerminal implements tickr.Storage.
 func (s *Store) PurgeTerminal(ctx context.Context, before time.Time, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 5000
@@ -777,6 +787,7 @@ SELECT event_type, status, count(*)::int
 FROM   tickr_messages
 GROUP BY event_type, status`
 
+// Stats implements tickr.Storage.
 func (s *Store) Stats(ctx context.Context) (tickr.Stats, error) {
 	rows, err := s.pool.Query(ctx, statsSQL)
 	if err != nil {
@@ -809,6 +820,7 @@ func (s *Store) Stats(ctx context.Context) (tickr.Stats, error) {
 
 // --- Migrations & Leader Lock ----------------------------------------------
 
+// ApplyMigrations implements tickr.Storage.
 func (s *Store) ApplyMigrations(ctx context.Context) error {
 	fsys, dir := s.migrationSource()
 	entries, err := fs.ReadDir(fsys, dir)

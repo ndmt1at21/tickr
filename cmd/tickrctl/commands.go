@@ -48,10 +48,10 @@ func cmdStats(ctx context.Context, store *pgstore.Store, args []string) error {
 		return json.NewEncoder(os.Stdout).Encode(stats)
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "EVENT_TYPE\tSTATUS\tDEPTH")
+	_, _ = fmt.Fprintln(tw, "EVENT_TYPE\tSTATUS\tDEPTH")
 	for et, byStatus := range stats.ByEventType {
 		for status, depth := range byStatus {
-			fmt.Fprintf(tw, "%s\t%s\t%d\n", et, status, depth)
+			_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\n", et, status, depth)
 		}
 	}
 	return tw.Flush()
@@ -100,9 +100,9 @@ func cmdDLQList(ctx context.Context, store *pgstore.Store, args []string) error 
 		return json.NewEncoder(os.Stdout).Encode(msgs)
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "ID\tEVENT_TYPE\tATTEMPT\tENQUEUED_AT\tLAST_ERROR")
+	_, _ = fmt.Fprintln(tw, "ID\tEVENT_TYPE\tATTEMPT\tENQUEUED_AT\tLAST_ERROR")
 	for _, m := range msgs {
-		fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n",
+		_, _ = fmt.Fprintf(tw, "%s\t%s\t%d\t%s\t%s\n",
 			m.ID, m.Type, m.Attempt,
 			m.EnqueuedAt.UTC().Format(time.RFC3339),
 			truncate(m.LastError, 80))
@@ -132,9 +132,9 @@ func cmdHistory(ctx context.Context, store *pgstore.Store, args []string) error 
 		return err
 	}
 	tw := tabwriter.NewWriter(os.Stdout, 0, 0, 2, ' ', 0)
-	fmt.Fprintln(tw, "SEQ\tFROM\tTO\tATTEMPT\tAT\tWORKER\tERROR")
+	_, _ = fmt.Fprintln(tw, "SEQ\tFROM\tTO\tATTEMPT\tAT\tWORKER\tERROR")
 	for _, t := range hist {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%s\t%s\t%s\n",
+		_, _ = fmt.Fprintf(tw, "%d\t%s\t%s\t%d\t%s\t%s\t%s\n",
 			t.Seq, t.From, t.To, t.Attempt,
 			t.At.UTC().Format(time.RFC3339),
 			t.WorkerID, truncate(t.Error, 80))

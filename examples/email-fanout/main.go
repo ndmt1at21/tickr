@@ -101,7 +101,7 @@ func deliverEmail(ctx context.Context, _ *tickr.InboundMessage, body EmailNotifi
 	if err != nil {
 		return err // transport error — retry per RetryPolicy
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
 
 	switch {

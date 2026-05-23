@@ -12,16 +12,15 @@ import (
 	"github.com/ndmt1at21/tickr"
 )
 
-// RunSuite runs the full conformance suite against store. The caller is
-// responsible for setting up the storage (e.g. ApplyMigrations) and
-// truncating between top-level test runs if needed.
-//
-// caps describes adapter capabilities so tests that depend on optional
-// features (e.g. Notifier) can be skipped where unsupported.
+// Capabilities describes adapter capabilities so tests that depend on
+// optional features (e.g. Notifier) can be skipped where unsupported.
 type Capabilities struct {
 	SupportsNotifier bool
 }
 
+// RunSuite runs the full conformance suite against store. The caller is
+// responsible for setting up the storage (e.g. ApplyMigrations) and
+// truncating between top-level test runs if needed.
 func RunSuite(t *testing.T, store tickr.Storage, caps Capabilities) {
 	t.Helper()
 	t.Run("enqueue_and_claim", func(t *testing.T) { testEnqueueAndClaim(t, store) })
@@ -233,13 +232,12 @@ func testLeaderLock(t *testing.T, store tickr.Storage) {
 	if !got1 {
 		t.Fatal("first acquire returned false")
 	}
-	got2, unlock2, err := store.TryLeaderLock(ctx(t), "test-leader")
+	got2, _, err := store.TryLeaderLock(ctx(t), "test-leader")
 	if err != nil {
 		t.Fatalf("second acquire: %v", err)
 	}
 	if got2 {
 		t.Fatal("second acquire should have failed while first holds")
-		unlock2()
 	}
 	unlock1()
 	got3, unlock3, err := store.TryLeaderLock(ctx(t), "test-leader")

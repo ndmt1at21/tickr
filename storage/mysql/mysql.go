@@ -232,9 +232,10 @@ func isDuplicateErr(err error) bool {
 
 // --- Claim ------------------------------------------------------------------
 
-// claimSQL: select candidate rows non-blockingly (SKIP LOCKED), then update
-// them in the same tx. database/sql doesn't give us a portable RETURNING,
-// so we use a two-step (SELECT FOR UPDATE SKIP LOCKED → UPDATE) within a tx.
+// Claim implements tickr.Storage.
+//
+// database/sql doesn't give us a portable RETURNING, so we use a two-step
+// (SELECT FOR UPDATE SKIP LOCKED → UPDATE) within a tx.
 func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.InboundMessage, error) {
 	if p.Batch <= 0 {
 		p.Batch = 100
@@ -274,12 +275,12 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 	for rows.Next() {
 		var id string
 		if err := rows.Scan(&id); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return nil, err
 		}
 		ids = append(ids, id)
 	}
-	rows.Close()
+	_ = rows.Close()
 	if len(ids) == 0 {
 		return nil, tx.Commit()
 	}
@@ -314,7 +315,7 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 	if err != nil {
 		return nil, fmt.Errorf("tickr/mysql: claim fetch: %w", err)
 	}
-	defer fetchRows.Close()
+	defer func() { _ = fetchRows.Close() }()
 	var out []*tickr.InboundMessage
 	for fetchRows.Next() {
 		msg, err := scanMessage(fetchRows)
@@ -340,6 +341,7 @@ func appendHistory(ctx context.Context, ex execer, id tickr.MessageID, from, to 
 
 // --- Succeed / Fail / Release / Extend --------------------------------------
 
+// Succeed implements tickr.Storage.
 func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, workerID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -357,6 +359,7 @@ func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, wo
 	return tx.Commit()
 }
 
+// Fail implements tickr.Storage.
 func (s *Store) Fail(ctx context.Context, p tickr.FailParams) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -391,6 +394,7 @@ func (s *Store) Fail(ctx context.Context, p tickr.FailParams) error {
 	return tx.Commit()
 }
 
+// ReleaseShutdown implements tickr.Storage.
 func (s *Store) ReleaseShutdown(ctx context.Context, id tickr.MessageID, attempt int, workerID, reason string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -411,6 +415,7 @@ func (s *Store) ReleaseShutdown(ctx context.Context, id tickr.MessageID, attempt
 	return tx.Commit()
 }
 
+// Extend implements tickr.Storage.
 func (s *Store) Extend(ctx context.Context, id tickr.MessageID, workerID string, until time.Time) (bool, error) {
 	res, err := s.db.ExecContext(ctx, `
         UPDATE tickr_messages
@@ -426,6 +431,7 @@ func (s *Store) Extend(ctx context.Context, id tickr.MessageID, workerID string,
 
 // --- History / DLQ / Requeue ------------------------------------------------
 
+// History implements tickr.Storage.
 func (s *Store) History(ctx context.Context, id tickr.MessageID) ([]tickr.Transition, error) {
 	rows, err := s.db.QueryContext(ctx, `
         SELECT message_id, seq, from_status, to_status, attempt, error, worker_id, at
@@ -433,7 +439,7 @@ func (s *Store) History(ctx context.Context, id tickr.MessageID) ([]tickr.Transi
 	if err != nil {
 		return nil, fmt.Errorf("tickr/mysql: history: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []tickr.Transition
 	for rows.Next() {
 		var (
@@ -464,6 +470,7 @@ func (s *Store) History(ctx context.Context, id tickr.MessageID) ([]tickr.Transi
 	return out, rows.Err()
 }
 
+// ListDead implements tickr.Storage.
 func (s *Store) ListDead(ctx context.Context, eventType string, after time.Time, limit int) ([]*tickr.InboundMessage, error) {
 	if limit <= 0 {
 		limit = 50
@@ -488,7 +495,7 @@ func (s *Store) ListDead(ctx context.Context, eventType string, after time.Time,
 	if err != nil {
 		return nil, fmt.Errorf("tickr/mysql: list dead: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	var out []*tickr.InboundMessage
 	for rows.Next() {
 		msg, err := scanMessage(rows)
@@ -500,6 +507,7 @@ func (s *Store) ListDead(ctx context.Context, eventType string, after time.Time,
 	return out, rows.Err()
 }
 
+// Requeue implements tickr.Storage.
 func (s *Store) Requeue(ctx context.Context, id tickr.MessageID, processAt time.Time) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -521,6 +529,7 @@ func (s *Store) Requeue(ctx context.Context, id tickr.MessageID, processAt time.
 
 // --- Reclaimer / Purger / Stats ---------------------------------------------
 
+// ReclaimExpired implements tickr.Storage.
 func (s *Store) ReclaimExpired(ctx context.Context, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 500
@@ -541,6 +550,7 @@ func (s *Store) ReclaimExpired(ctx context.Context, limit int) (int64, error) {
 	return n, nil
 }
 
+// PurgeTerminal implements tickr.Storage.
 func (s *Store) PurgeTerminal(ctx context.Context, before time.Time, limit int) (int64, error) {
 	if limit <= 0 {
 		limit = 5000
@@ -557,6 +567,7 @@ func (s *Store) PurgeTerminal(ctx context.Context, before time.Time, limit int) 
 	return n, nil
 }
 
+// Stats implements tickr.Storage.
 func (s *Store) Stats(ctx context.Context) (tickr.Stats, error) {
 	rows, err := s.db.QueryContext(ctx, `
         SELECT event_type, status, COUNT(*)
@@ -564,7 +575,7 @@ func (s *Store) Stats(ctx context.Context) (tickr.Stats, error) {
 	if err != nil {
 		return tickr.Stats{}, fmt.Errorf("tickr/mysql: stats: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 	out := tickr.Stats{
 		ByStatus:    map[tickr.Status]int{},
 		ByEventType: map[string]map[tickr.Status]int{},
@@ -590,6 +601,7 @@ func (s *Store) Stats(ctx context.Context) (tickr.Stats, error) {
 
 // --- Migrations & Leader Lock ----------------------------------------------
 
+// ApplyMigrations implements tickr.Storage.
 func (s *Store) ApplyMigrations(ctx context.Context) error {
 	entries, err := fs.ReadDir(migrationsFS, "migrations")
 	if err != nil {
@@ -613,12 +625,12 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 	for rows.Next() {
 		var v int
 		if err := rows.Scan(&v); err != nil {
-			rows.Close()
+			_ = rows.Close()
 			return err
 		}
 		applied[v] = true
 	}
-	rows.Close()
+	_ = rows.Close()
 
 	for _, e := range entries {
 		name := e.Name()

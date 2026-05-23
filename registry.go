@@ -22,7 +22,7 @@ type registration struct {
 type handlerConfig struct {
 	maxAttempts    int
 	retry          RetryPolicy
-	maxInflight    int                // 0 = no per-event-type cap
+	maxInflight    int // 0 = no per-event-type cap
 	attemptTimeout time.Duration
 	deadLetterIf   func(error) bool
 }

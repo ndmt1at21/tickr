@@ -13,8 +13,8 @@ import (
 	tcmysql "github.com/testcontainers/testcontainers-go/modules/mysql"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	mysqlstore "github.com/ndmt1at21/tickr/storage/mysql"
 	"github.com/ndmt1at21/tickr/storage/internal/storagetest"
+	mysqlstore "github.com/ndmt1at21/tickr/storage/mysql"
 )
 
 func TestMySQLSuite(t *testing.T) {

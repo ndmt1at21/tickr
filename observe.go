@@ -65,13 +65,13 @@ func (nopLogger) Error(context.Context, string, error, ...any) {}
 // nopMetrics is the default when no Metrics is configured.
 type nopMetrics struct{}
 
-func (nopMetrics) MessageEnqueued(string)                                       {}
-func (nopMetrics) HandlerStarted(string, int)                                   {}
-func (nopMetrics) HandlerCompleted(string, int, time.Duration, Outcome)         {}
-func (nopMetrics) MessageDead(string)                                           {}
-func (nopMetrics) QueueDepth(string, Status, int)                               {}
-func (nopMetrics) ClaimBatch(int, int, time.Duration)                           {}
-func (nopMetrics) LeaseReclaimed(string, int)                                   {}
+func (nopMetrics) MessageEnqueued(string)                               {}
+func (nopMetrics) HandlerStarted(string, int)                           {}
+func (nopMetrics) HandlerCompleted(string, int, time.Duration, Outcome) {}
+func (nopMetrics) MessageDead(string)                                   {}
+func (nopMetrics) QueueDepth(string, Status, int)                       {}
+func (nopMetrics) ClaimBatch(int, int, time.Duration)                   {}
+func (nopMetrics) LeaseReclaimed(string, int)                           {}
 
 // nopTracer is the default when no Tracer is configured. Spans are no-ops
 // and InjectHeaders returns the headers unchanged.

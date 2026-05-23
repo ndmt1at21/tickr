@@ -12,8 +12,8 @@ import (
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
-	pgstore "github.com/ndmt1at21/tickr/storage/postgres"
 	"github.com/ndmt1at21/tickr/storage/internal/storagetest"
+	pgstore "github.com/ndmt1at21/tickr/storage/postgres"
 )
 
 func TestPostgresSuite(t *testing.T) {
