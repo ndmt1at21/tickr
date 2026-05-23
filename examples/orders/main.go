@@ -34,10 +34,10 @@ import (
 	semconv "go.opentelemetry.io/otel/semconv/v1.26.0"
 
 	"github.com/ndmt1at21/tickr"
-	jsoncodec "github.com/ndmt1at21/tickr/codec/json"
 	tprom "github.com/ndmt1at21/tickr/metrics/prom"
 	pgstore "github.com/ndmt1at21/tickr/storage/postgres"
 	totel "github.com/ndmt1at21/tickr/tracing/otel"
+	"github.com/ndmt1at21/tickr/ui"
 )
 
 type orderCreated struct {
@@ -101,8 +101,8 @@ func main() {
 	}
 
 	registry := tickr.NewRegistry()
-	if err := registry.On("order.created",
-		jsoncodec.Wrap(func(ctx context.Context, msg *tickr.InboundMessage, body orderCreated) error {
+	if err := tickr.On(registry, "order.created",
+		func(ctx context.Context, msg *tickr.InboundMessage, body orderCreated) error {
 			log.InfoContext(ctx, "handling order.created",
 				"message_id", msg.ID, "attempt", msg.Attempt,
 				"order_id", body.OrderID, "total", body.Total)
@@ -112,7 +112,7 @@ func main() {
 				return errors.New("simulated downstream blip")
 			}
 			return nil
-		}),
+		},
 		tickr.WithMaxAttempts(5),
 		tickr.WithAttemptTimeout(10*time.Second),
 	); err != nil {
@@ -136,6 +136,8 @@ func main() {
 	// --- HTTP --------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(promReg, promhttp.HandlerOpts{}))
+	// Embedded admin dashboard — browse messages, retry/kill, view history.
+	mux.Handle("/tickr/", http.StripPrefix("/tickr", ui.Handler(store, ui.Options{Title: "orders"})))
 	mux.HandleFunc("/orders", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -166,7 +168,7 @@ func main() {
 			return
 		}
 
-		payload, _ := jsoncodec.Encode(body)
+		payload, _ := tickr.Encode(body)
 		id, err := client.Enqueue(r.Context(), pgstore.WrapTx(tx), tickr.Message{
 			Type:           "order.created",
 			Payload:        payload,

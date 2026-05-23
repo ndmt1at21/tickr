@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{TITLE}} — outbox dashboard</title>
+  <link rel="stylesheet" href="static/style.css">
+</head>
+<body data-readonly="{{READONLY}}">
+  <header>
+    <h1>{{TITLE}}</h1>
+    <div id="totals"></div>
+    <button id="refresh" title="Refresh">↻</button>
+  </header>
+
+  <section id="stats" aria-label="Status totals"></section>
+
+  <section id="filters">
+    <label>Status
+      <select id="filter-status">
+        <option value="">any</option>
+        <option>CREATED</option>
+        <option>HANDLING</option>
+        <option>FAILED</option>
+        <option>RETRYING</option>
+        <option>SUCCESS</option>
+        <option>DEAD</option>
+      </select>
+    </label>
+    <label>Event type
+      <select id="filter-event-type"><option value="">any</option></select>
+    </label>
+    <label>Search
+      <input id="filter-search" type="search" placeholder="payload or idempotency key">
+    </label>
+  </section>
+
+  <table id="messages">
+    <thead>
+      <tr>
+        <th>ID</th><th>Type</th><th>Status</th><th>Attempt</th>
+        <th>Enqueued</th><th>Scheduled</th><th>Last error</th><th></th>
+      </tr>
+    </thead>
+    <tbody></tbody>
+  </table>
+  <div id="pager"><button id="load-more" hidden>Load more</button></div>
+
+  <dialog id="detail">
+    <header>
+      <span id="detail-title">Message</span>
+      <button id="detail-close" aria-label="Close">×</button>
+    </header>
+    <div id="detail-body"></div>
+  </dialog>
+
+  <script src="static/app.js"></script>
+</body>
+</html>

@@ -74,6 +74,12 @@ type InboundMessage struct {
 	// LastError is the error string from the previous attempt, or "" on the
 	// first attempt.
 	LastError string
+
+	// Status is the row's lifecycle status at the time it was read.
+	// Populated by [Admin.List] and [Admin.Get]; on the [Handler] hot path
+	// it is always [StatusHandling] (set by the claim) and handlers can
+	// safely ignore it.
+	Status Status
 }
 
 // Transition is one row in the append-only message history.

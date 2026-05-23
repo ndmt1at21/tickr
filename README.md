@@ -24,7 +24,8 @@ Target throughput: **1M messages/minute** across a horizontally scaled fleet.
 ```
 tickr/                       core API (Client, Worker, types, Storage interface)
   storage/postgres/          PostgreSQL adapter + embedded migrations
-  codec/json/                typed-handler wrapper (encoding/json)
+  codec/json/                low-level json codec (most users want tickr.On[T])
+  ui/                        embeddable admin dashboard (HTML + JSON APIs)
   metrics/prom/              Prometheus implementation of tickr.Metrics
   tracing/otel/              OpenTelemetry implementation of tickr.Tracer
   grafana/                   ready-to-import dashboard JSON
@@ -43,7 +44,7 @@ defer tx.Rollback(ctx)
 
 if _, err := tx.Exec(ctx, `INSERT INTO orders …`); err != nil { return err }
 
-payload, _ := json.Marshal(order)
+payload, _ := tickr.Encode(order)
 _, err := client.Enqueue(ctx, pgstore.WrapTx(tx), tickr.Message{
     Type:           "order.created",
     Payload:        payload,
@@ -56,12 +57,16 @@ return tx.Commit(ctx)
 
 ## Consumer (worker side)
 
+`tickr.On[T]` registers a typed handler — the payload is JSON-decoded
+into `T` before your function runs. A malformed payload is dead-lettered
+immediately (it won't decode on retry either).
+
 ```go
 reg := tickr.NewRegistry()
-_ = reg.On("order.created",
-    jsoncodec.Wrap(func(ctx context.Context, msg *tickr.InboundMessage, body OrderCreated) error {
+_ = tickr.On(reg, "order.created",
+    func(ctx context.Context, msg *tickr.InboundMessage, body OrderCreated) error {
         return chargeCustomer(ctx, body)
-    }),
+    },
     tickr.WithMaxAttempts(5),
     tickr.WithAttemptTimeout(10*time.Second),
 )
@@ -73,6 +78,26 @@ w, _ := tickr.NewWorker(tickr.WorkerConfig{
 })
 _ = w.Start(ctx) // blocks until ctx is cancelled
 ```
+
+Drop down to `reg.On(eventType, tickr.Handler, …)` when you need raw
+`[]byte` access or a non-JSON codec.
+
+## Embedded admin dashboard
+
+Mount the dashboard on any `http.ServeMux` for an in-browser view of
+messages, history, retry / kill actions:
+
+```go
+import "github.com/ndmt1at21/tickr/ui"
+
+mux.Handle("/tickr/", http.StripPrefix("/tickr",
+    ui.Handler(store, ui.Options{Title: "orders"})))
+```
+
+It serves a single-file dashboard plus JSON APIs under `/api/`. Pass
+`ui.Options{ReadOnly: true}` to disable mutating actions for viewers.
+The handler is transport-agnostic — pair it with your own auth
+middleware before exposing it publicly.
 
 ## Migrations
 

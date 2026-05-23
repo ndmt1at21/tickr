@@ -193,6 +193,7 @@ func scanMessage(row pgx.Row) (*tickr.InboundMessage, error) {
 		MaxAttempts: maxAttempts,
 		EnqueuedAt:  createdAt,
 		ScheduledAt: processAt,
+		Status:      tickr.Status(status),
 	}
 	if idemKey != nil {
 		out.IdempotencyKey = *idemKey
