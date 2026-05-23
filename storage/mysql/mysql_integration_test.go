@@ -46,17 +46,36 @@ func TestMySQLSuite(t *testing.T) {
 	t.Cleanup(func() { _ = db.Close() })
 	// MySQL containers occasionally accept connections during the "temp
 	// init" → "real start" handover and then drop them with EOF; retry
-	// briefly until the server settles.
-	pingCtx, pingCancel := context.WithTimeout(ctx, 30*time.Second)
+	// until we get several consecutive successful pings on fresh
+	// connections so any conns opened during the flaky window are
+	// flushed out of the pool before the suite runs.
+	pingCtx, pingCancel := context.WithTimeout(ctx, 60*time.Second)
 	defer pingCancel()
-	for {
-		if err := db.PingContext(pingCtx); err == nil {
-			break
-		} else if pingCtx.Err() != nil {
-			t.Fatalf("ping: %v", err)
+	const wantStable = 5
+	stable := 0
+	for stable < wantStable {
+		conn, err := db.Conn(pingCtx)
+		if err == nil {
+			if err := conn.PingContext(pingCtx); err == nil {
+				stable++
+			} else {
+				stable = 0
+			}
+			_ = conn.Close()
+		} else {
+			stable = 0
 		}
-		time.Sleep(500 * time.Millisecond)
+		if pingCtx.Err() != nil {
+			t.Fatalf("mysql never stabilized: %v", err)
+		}
+		if stable < wantStable {
+			time.Sleep(500 * time.Millisecond)
+		}
 	}
+	// Drop any idle conns that were opened (and possibly half-broken)
+	// during the wait loop. Subsequent operations will open fresh ones.
+	db.SetMaxIdleConns(0)
+	db.SetMaxIdleConns(2)
 
 	store := mysqlstore.New(db)
 	if err := store.ApplyMigrations(ctx); err != nil {

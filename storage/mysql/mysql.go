@@ -315,14 +315,23 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 	if err != nil {
 		return nil, fmt.Errorf("tickr/mysql: claim fetch: %w", err)
 	}
-	defer func() { _ = fetchRows.Close() }()
 	var out []*tickr.InboundMessage
 	for fetchRows.Next() {
 		msg, err := scanMessage(fetchRows)
 		if err != nil {
+			_ = fetchRows.Close()
 			return nil, err
 		}
 		out = append(out, msg)
+	}
+	if err := fetchRows.Close(); err != nil {
+		return nil, fmt.Errorf("tickr/mysql: claim fetch close: %w", err)
+	}
+	// History rows are written after the fetch cursor is closed: MySQL
+	// doesn't allow another query on the same connection while a rows
+	// iterator is still open, and silently corrupting tx state that way
+	// makes the subsequent COMMIT fail with "invalid connection".
+	for _, msg := range out {
 		appendHistory(ctx, tx, msg.ID, "HANDLING", "HANDLING", msg.Attempt, "", p.WorkerID)
 	}
 	if err := tx.Commit(); err != nil {

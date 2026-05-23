@@ -19,9 +19,11 @@ package cockroach
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ndmt1at21/tickr"
@@ -39,7 +41,7 @@ type Store struct {
 // New wraps an existing pgxpool.Pool connected to a CockroachDB cluster.
 func New(pool *pgxpool.Pool) *Store {
 	return &Store{
-		Storage: pgstore.New(pool),
+		Storage: pgstore.New(pool, pgstore.WithoutNotifier()),
 		pool:    pool,
 	}
 }
@@ -83,6 +85,12 @@ func (s *Store) TryLeaderLock(ctx context.Context, key string) (bool, func(), er
         RETURNING tickr_locks.holder = $2`,
 		key, holder).Scan(&got)
 	if err != nil {
+		// ON CONFLICT DO UPDATE ... WHERE filters out the update when the
+		// existing lock is still live, leaving no row to RETURN. Treat that
+		// as contention, not an error.
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, nil, nil
+		}
 		return false, nil, fmt.Errorf("tickr/cockroach: try leader lock: %w", err)
 	}
 	if !got {

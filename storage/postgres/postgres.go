@@ -32,6 +32,16 @@ var partitionedMigrationsFS embed.FS
 // Option configures a Store at construction time.
 type Option func(*Store)
 
+// WithoutNotifier disables the automatic pg_notify emitted from Enqueue.
+// Use this when the underlying engine doesn't support LISTEN/NOTIFY (e.g.
+// CockroachDB) — leaving it enabled would cause Enqueue to fail with
+// "unknown function: pg_notify()". The Store will also not satisfy the
+// tickr.Notifier interface in any caller-meaningful way when this is set;
+// callers should rely on polling instead.
+func WithoutNotifier() Option {
+	return func(s *Store) { s.notifierDisabled = true }
+}
+
 // WithPartitioning switches the adapter to the partitioned schema variant:
 // tickr_messages is RANGE-partitioned by created_at, retention can be
 // implemented via DROP PARTITION (drastically cheaper than DELETE on
@@ -49,8 +59,9 @@ func WithPartitioning() Option {
 
 // Store is the Postgres-backed Storage implementation.
 type Store struct {
-	pool        *pgxpool.Pool
-	partitioned bool
+	pool             *pgxpool.Pool
+	partitioned      bool
+	notifierDisabled bool
 }
 
 // New wraps an existing pgxpool.Pool. Callers own the pool lifecycle.
@@ -243,11 +254,32 @@ func (s *Store) Enqueue(ctx context.Context, tx tickr.Tx, p tickr.EnqueueParams)
 		idemArg = p.IdempotencyKey
 	}
 
+	// Partitioned mode can't enforce uniqueness on (event_type, idempotency_key)
+	// alone — its unique index must include the partition key (created_at).
+	// Fall back to an app-level lookup before inserting. The check-then-insert
+	// is not atomic; concurrent enqueues racing the same key remain a known
+	// trade-off documented in migrations_partitioned/0001_init.sql.
+	if s.partitioned && p.IdempotencyKey != "" {
+		existing, err := s.findByIdempotency(ctx, q, p.EventType, p.IdempotencyKey)
+		if err == nil {
+			return existing, &tickr.ErrDuplicate{
+				ExistingID: existing.ID,
+				EventType:  p.EventType,
+				Key:        p.IdempotencyKey,
+			}
+		} else if !errors.Is(err, pgx.ErrNoRows) {
+			return nil, err
+		}
+	}
+
 	row := q.QueryRow(ctx, s.insertSQL(),
 		id, p.EventType, p.Payload, encodeHeaders(p.Headers),
 		idemArg, maxAttempts, processAt)
 	msg, err := scanMessage(row)
 	if err == nil {
+		if nerr := s.notifyEnqueue(ctx, tx, p.EventType); nerr != nil {
+			return msg, nerr
+		}
 		return msg, nil
 	}
 	if !errors.Is(err, pgx.ErrNoRows) {
@@ -266,6 +298,17 @@ func (s *Store) Enqueue(ctx context.Context, tx tickr.Tx, p tickr.EnqueueParams)
 		EventType:  p.EventType,
 		Key:        p.IdempotencyKey,
 	}
+}
+
+// notifyEnqueue fires pg_notify for a freshly inserted row. Skipped when
+// WithoutNotifier is set (e.g. CockroachDB doesn't implement pg_notify).
+// Failures do not roll back the insert but are surfaced so callers can log
+// them.
+func (s *Store) notifyEnqueue(ctx context.Context, tx tickr.Tx, eventType string) error {
+	if s.notifierDisabled {
+		return nil
+	}
+	return s.Notify(ctx, tx, eventType)
 }
 
 const findByIdemSQL = `
@@ -387,7 +430,8 @@ SET    status        = 'HANDLING',
        updated_at    = now()
 FROM   eligible e
 WHERE  m.id = e.id
-RETURNING ` + messageReturnCols
+RETURNING m.id, m.event_type, m.payload, m.headers, m.idempotency_key,
+	m.status, m.attempt, m.max_attempts, m.process_at, m.created_at, m.last_error`
 
 // Claim implements tickr.Storage.
 func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.InboundMessage, error) {
@@ -395,7 +439,7 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 		p.Batch = 1
 	}
 	leaseSec := int(p.Lease.Seconds())
-	if leaseSec <= 0 {
+	if p.Lease == 0 {
 		leaseSec = 30
 	}
 	var eventTypes any
