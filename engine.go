@@ -21,6 +21,10 @@ type engineConfig struct {
 	lease          time.Duration
 	shutdownGrace  time.Duration
 
+	// notify, when non-nil, wakes the poll loop out of its backoff
+	// whenever a new message is enqueued. Coalesced; treat as hint only.
+	notify <-chan struct{}
+
 	logger  Logger
 	metrics Metrics
 	tracer  Tracer
@@ -86,6 +90,9 @@ func (e *engine) run(ctx context.Context) error {
 		case <-ctx.Done():
 			return e.drain()
 		case <-time.After(currentDelay):
+		case <-e.cfg.notify:
+			// New work signalled — reset backoff and poll immediately.
+			currentDelay = pollInterval
 		}
 	}
 }

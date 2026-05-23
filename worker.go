@@ -47,6 +47,7 @@ type WorkerConfig struct {
 
 	DisableReclaimer bool
 	DisableJanitor   bool
+	DisableNotifier  bool
 }
 
 // Worker runs the claim loop, dispatches handlers, and (when leader) runs
@@ -109,6 +110,18 @@ func (w *Worker) Start(ctx context.Context) error {
 	ctx, cancel := context.WithCancel(ctx)
 	w.cancel = cancel
 	defer cancel()
+
+	// Optional notifier: if the Storage implements Notifier, subscribe so
+	// the engine can wake up immediately on new enqueues.
+	if n, ok := w.cfg.Storage.(Notifier); ok && !w.cfg.DisableNotifier {
+		ch, cleanup, err := n.Listen(ctx)
+		if err != nil {
+			w.cfg.Logger.Warn(ctx, "tickr: notifier listen failed, falling back to polling", "err", err)
+		} else {
+			w.eng.cfg.notify = ch
+			defer func() { _ = cleanup() }()
+		}
+	}
 
 	var bgWg sync.WaitGroup
 	if !w.cfg.DisableReclaimer {

@@ -209,6 +209,28 @@ Observe:
 - Grafana (`http://localhost:3000`): throughput, latency, queue depth
 - Tempo: end-to-end span from HTTP request → enqueue → handler
 
+## Limitations
+
+Before adopting, read [ARCHITECTURE.md §11](ARCHITECTURE.md#11-limitations).
+Highlights:
+
+- Producer and outbox must share a database (the outbox guarantee
+  requires a single transaction).
+- At-least-once delivery only — handlers must be idempotent.
+- Partitioned Postgres scopes idempotency per partition (per month by
+  default).
+- MySQL and CockroachDB adapters do not implement `LISTEN/NOTIFY` and
+  fall back to pure polling (~100 ms typical wake-up).
+- `tickr_history` retention is currently manual.
+
+Section 11.3 lists planned follow-ups; contributions welcome.
+
+## Architecture
+
+See [ARCHITECTURE.md](ARCHITECTURE.md) for the design deep-dive: status
+machine, claim query, lease auto-extension, partitioning trade-offs,
+leader-lock strategies per adapter, and the conformance suite.
+
 ## License
 
 Released under the [MIT License](LICENSE).

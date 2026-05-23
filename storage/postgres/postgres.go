@@ -26,13 +26,41 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
+//go:embed migrations_partitioned/*.sql
+var partitionedMigrationsFS embed.FS
+
+// Option configures a Store at construction time.
+type Option func(*Store)
+
+// WithPartitioning switches the adapter to the partitioned schema variant:
+// tickr_messages is RANGE-partitioned by created_at, retention can be
+// implemented via DROP PARTITION (drastically cheaper than DELETE on
+// multi-100M-row tables), and EnsurePartitions creates monthly partitions
+// ahead of time.
+//
+// Trade-off: idempotency uniqueness is scoped per partition. See
+// migrations_partitioned/0001_init.sql for details.
+//
+// Must be set before ApplyMigrations; switching modes on an existing schema
+// is not supported.
+func WithPartitioning() Option {
+	return func(s *Store) { s.partitioned = true }
+}
+
 // Store is the Postgres-backed Storage implementation.
 type Store struct {
-	pool *pgxpool.Pool
+	pool        *pgxpool.Pool
+	partitioned bool
 }
 
 // New wraps an existing pgxpool.Pool. Callers own the pool lifecycle.
-func New(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
+func New(pool *pgxpool.Pool, opts ...Option) *Store {
+	s := &Store{pool: pool}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
+}
 
 // --- transaction wrapper ----------------------------------------------------
 
@@ -179,6 +207,24 @@ ON CONFLICT (event_type, idempotency_key) WHERE idempotency_key IS NOT NULL
     DO NOTHING
 RETURNING ` + messageReturnCols
 
+// Partitioned variant: ON CONFLICT must reference the partition key as well.
+const enqueueSQLPartitioned = `
+INSERT INTO tickr_messages
+    (id, event_type, payload, headers, idempotency_key, status,
+     attempt, max_attempts, process_at, created_at, updated_at)
+VALUES ($1, $2, $3, $4, $5, 'CREATED',
+        0, $6, $7, now(), now())
+ON CONFLICT (event_type, idempotency_key, created_at) WHERE idempotency_key IS NOT NULL
+    DO NOTHING
+RETURNING ` + messageReturnCols
+
+func (s *Store) insertSQL() string {
+	if s.partitioned {
+		return enqueueSQLPartitioned
+	}
+	return enqueueSQL
+}
+
 // Enqueue implements tickr.Storage.
 func (s *Store) Enqueue(ctx context.Context, tx tickr.Tx, p tickr.EnqueueParams) (*tickr.InboundMessage, error) {
 	q := s.querier(tx)
@@ -197,7 +243,7 @@ func (s *Store) Enqueue(ctx context.Context, tx tickr.Tx, p tickr.EnqueueParams)
 		idemArg = p.IdempotencyKey
 	}
 
-	row := q.QueryRow(ctx, enqueueSQL,
+	row := q.QueryRow(ctx, s.insertSQL(),
 		id, p.EventType, p.Payload, encodeHeaders(p.Headers),
 		idemArg, maxAttempts, processAt)
 	msg, err := scanMessage(row)
@@ -258,7 +304,7 @@ func (s *Store) EnqueueBatch(ctx context.Context, tx tickr.Tx, ps []tickr.Enqueu
 		if p.IdempotencyKey != "" {
 			idemArg = p.IdempotencyKey
 		}
-		batch.Queue(enqueueSQL,
+		batch.Queue(s.insertSQL(),
 			id, p.EventType, p.Payload, encodeHeaders(p.Headers),
 			idemArg, maxAttempts, processAt)
 	}
@@ -764,7 +810,8 @@ func (s *Store) Stats(ctx context.Context) (tickr.Stats, error) {
 // --- Migrations & Leader Lock ----------------------------------------------
 
 func (s *Store) ApplyMigrations(ctx context.Context) error {
-	entries, err := fs.ReadDir(migrationsFS, "migrations")
+	fsys, dir := s.migrationSource()
+	entries, err := fs.ReadDir(fsys, dir)
 	if err != nil {
 		return fmt.Errorf("tickr/postgres: read migrations: %w", err)
 	}
@@ -808,7 +855,7 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 		if applied[version] {
 			continue
 		}
-		b, err := fs.ReadFile(migrationsFS, "migrations/"+name)
+		b, err := fs.ReadFile(fsys, dir+"/"+name)
 		if err != nil {
 			return fmt.Errorf("tickr/postgres: read migration %s: %w", name, err)
 		}
@@ -829,6 +876,136 @@ func (s *Store) ApplyMigrations(ctx context.Context) error {
 		}
 	}
 	return nil
+}
+
+// migrationSource picks the embedded migration set matching the configured
+// schema variant.
+func (s *Store) migrationSource() (fs.FS, string) {
+	if s.partitioned {
+		return partitionedMigrationsFS, "migrations_partitioned"
+	}
+	return migrationsFS, "migrations"
+}
+
+// EnsurePartitions creates monthly partitions of tickr_messages from the
+// current month through monthsAhead months in the future, if they do not
+// already exist. Safe to call repeatedly (every method is IF NOT EXISTS).
+// No-op when the store was not constructed with WithPartitioning.
+//
+// Recommended cadence: once per day from a leader-elected background loop.
+func (s *Store) EnsurePartitions(ctx context.Context, monthsAhead int) error {
+	if !s.partitioned {
+		return nil
+	}
+	if monthsAhead < 0 {
+		monthsAhead = 0
+	}
+	now := time.Now().UTC()
+	start := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	for i := 0; i <= monthsAhead; i++ {
+		from := start.AddDate(0, i, 0)
+		to := start.AddDate(0, i+1, 0)
+		name := fmt.Sprintf("tickr_messages_%04d_%02d", from.Year(), from.Month())
+		stmt := fmt.Sprintf(
+			`CREATE TABLE IF NOT EXISTS %s PARTITION OF tickr_messages
+                 FOR VALUES FROM ('%s') TO ('%s')`,
+			name,
+			from.Format("2006-01-02"),
+			to.Format("2006-01-02"),
+		)
+		if _, err := s.pool.Exec(ctx, stmt); err != nil {
+			return fmt.Errorf("tickr/postgres: create partition %s: %w", name, err)
+		}
+	}
+	return nil
+}
+
+// DropPartitionsBefore drops monthly partitions whose entire range ends at
+// or before cutoff. This is the cheap retention path for partitioned mode:
+// dropping a partition is O(1) regardless of row count, where DELETE on the
+// unpartitioned schema is O(rows). Returns the number of partitions dropped.
+//
+// No-op when the store was not constructed with WithPartitioning.
+func (s *Store) DropPartitionsBefore(ctx context.Context, cutoff time.Time) (int, error) {
+	if !s.partitioned {
+		return 0, nil
+	}
+	// Find child partitions of tickr_messages and parse their upper bound.
+	// pg_inherits + pg_get_expr exposes the FOR VALUES clause as text.
+	rows, err := s.pool.Query(ctx, `
+        SELECT c.relname,
+               pg_get_expr(c.relpartbound, c.oid) AS bound
+        FROM pg_class p
+        JOIN pg_inherits i  ON i.inhparent = p.oid
+        JOIN pg_class    c  ON c.oid = i.inhrelid
+        WHERE p.relname = 'tickr_messages'`)
+	if err != nil {
+		return 0, fmt.Errorf("tickr/postgres: list partitions: %w", err)
+	}
+	type cand struct{ name, bound string }
+	var partitions []cand
+	for rows.Next() {
+		var c cand
+		if err := rows.Scan(&c.name, &c.bound); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		partitions = append(partitions, c)
+	}
+	rows.Close()
+
+	dropped := 0
+	for _, p := range partitions {
+		// Skip the DEFAULT partition.
+		if strings.Contains(p.bound, "DEFAULT") {
+			continue
+		}
+		// Parse FOR VALUES FROM ('YYYY-MM-DD ...') TO ('YYYY-MM-DD ...').
+		upper, ok := parseUpperBound(p.bound)
+		if !ok {
+			continue
+		}
+		if upper.After(cutoff) {
+			continue
+		}
+		if _, err := s.pool.Exec(ctx,
+			fmt.Sprintf(`DROP TABLE IF EXISTS %s`, p.name)); err != nil {
+			return dropped, fmt.Errorf("tickr/postgres: drop partition %s: %w", p.name, err)
+		}
+		dropped++
+	}
+	return dropped, nil
+}
+
+// parseUpperBound extracts the TO timestamp from a FOR VALUES expression of
+// the form: FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('2026-02-01 00:00:00+00')
+func parseUpperBound(bound string) (time.Time, bool) {
+	const marker = "TO ("
+	i := strings.Index(bound, marker)
+	if i < 0 {
+		return time.Time{}, false
+	}
+	rest := bound[i+len(marker):]
+	start := strings.Index(rest, "'")
+	if start < 0 {
+		return time.Time{}, false
+	}
+	rest = rest[start+1:]
+	end := strings.Index(rest, "'")
+	if end < 0 {
+		return time.Time{}, false
+	}
+	tsStr := rest[:end]
+	for _, layout := range []string{
+		"2006-01-02 15:04:05-07",
+		"2006-01-02 15:04:05",
+		"2006-01-02",
+	} {
+		if t, err := time.Parse(layout, tsStr); err == nil {
+			return t, true
+		}
+	}
+	return time.Time{}, false
 }
 
 // TryLeaderLock acquires a session-scoped pg_try_advisory_lock keyed by
@@ -861,3 +1038,73 @@ func (s *Store) TryLeaderLock(ctx context.Context, key string) (bool, func(), er
 
 // Ensure Store satisfies tickr.Storage at compile time.
 var _ tickr.Storage = (*Store)(nil)
+
+// --- Notifier (LISTEN/NOTIFY) ----------------------------------------------
+
+// notifyChannel is the single Postgres NOTIFY channel tickr uses across all
+// event types. Filtering by EventTypes still happens server-side at claim,
+// so a single channel keeps the listener simple and cheap.
+const notifyChannel = "tickr_msg"
+
+// Notify implements tickr.Notifier. The notification is enqueued in the
+// caller's transaction when present, and only delivered to listeners once
+// that transaction commits — preserving the transactional outbox guarantee.
+//
+// eventType is sent as the payload so that future versions could route per
+// type without a wire-format break; the current Listen impl ignores it.
+func (s *Store) Notify(ctx context.Context, tx tickr.Tx, eventType string) error {
+	q := s.querier(tx)
+	// pg_notify is the parameterised form of NOTIFY (the SQL NOTIFY
+	// statement does not accept parameters).
+	if _, err := q.Exec(ctx, `SELECT pg_notify($1, $2)`, notifyChannel, eventType); err != nil {
+		return fmt.Errorf("tickr/postgres: pg_notify: %w", err)
+	}
+	return nil
+}
+
+// Listen implements tickr.Notifier. It hijacks a dedicated connection from
+// the pool (the listener cannot be shared with normal queries because of
+// LISTEN's session-scoped state) and forwards coalesced notifications to
+// the returned channel.
+func (s *Store) Listen(ctx context.Context) (<-chan struct{}, func() error, error) {
+	pc, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return nil, nil, fmt.Errorf("tickr/postgres: acquire listener conn: %w", err)
+	}
+	conn := pc.Hijack()
+	if _, err := conn.Exec(ctx, "LISTEN "+notifyChannel); err != nil {
+		_ = conn.Close(ctx)
+		return nil, nil, fmt.Errorf("tickr/postgres: LISTEN: %w", err)
+	}
+
+	out := make(chan struct{}, 1)
+	listenCtx, cancel := context.WithCancel(ctx)
+
+	go func() {
+		defer close(out)
+		for {
+			if _, err := conn.WaitForNotification(listenCtx); err != nil {
+				if listenCtx.Err() != nil {
+					return
+				}
+				// Connection-level error: bail out so the worker can fall
+				// back to pure polling. The next Worker.Start can retry.
+				return
+			}
+			select {
+			case out <- struct{}{}:
+			default:
+				// Already pending — coalesce.
+			}
+		}
+	}()
+
+	cleanup := func() error {
+		cancel()
+		return conn.Close(context.Background())
+	}
+	return out, cleanup, nil
+}
+
+// Ensure Store satisfies tickr.Notifier at compile time.
+var _ tickr.Notifier = (*Store)(nil)

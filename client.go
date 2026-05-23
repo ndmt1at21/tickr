@@ -108,6 +108,16 @@ func (c *Client) Enqueue(ctx context.Context, tx Tx, msg Message) (MessageID, er
 		return "", err
 	}
 	c.mx.MessageEnqueued(msg.Type)
+	// Best-effort notification — never fails the enqueue. Notifications
+	// are only delivered to subscribers after the caller transaction
+	// commits, so the outbox guarantee is preserved.
+	if !IsDuplicate(err) {
+		if n, ok := c.cfg.Storage.(Notifier); ok {
+			if nerr := n.Notify(ctx, tx, msg.Type); nerr != nil {
+				c.log.Warn(ctx, "tickr: notify failed", "event_type", msg.Type, "err", nerr)
+			}
+		}
+	}
 	return out.ID, err // err may be *ErrDuplicate
 }
 
@@ -145,10 +155,20 @@ func (c *Client) EnqueueBatch(ctx context.Context, tx Tx, msgs []Message) ([]Mes
 	}
 	out, err := c.cfg.Storage.EnqueueBatch(ctx, tx, params)
 	ids := make([]MessageID, len(out))
+	notifier, hasNotifier := c.cfg.Storage.(Notifier)
+	seen := map[string]struct{}{}
 	for i, m := range out {
 		if m != nil {
 			ids[i] = m.ID
 			c.mx.MessageEnqueued(m.Type)
+			if hasNotifier {
+				if _, dup := seen[m.Type]; !dup {
+					seen[m.Type] = struct{}{}
+					if nerr := notifier.Notify(ctx, tx, m.Type); nerr != nil {
+						c.log.Warn(ctx, "tickr: notify failed", "event_type", m.Type, "err", nerr)
+					}
+				}
+			}
 		}
 	}
 	return ids, err
