@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.x"
+          check-latest: true
+          cache: true
+
+      - name: Verify tag matches go.mod
+        run: |
+          go vet ./...
+          go test ./...
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          generate_release_notes: true
+          draft: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
+
+      - name: Trigger pkg.go.dev refresh
+        run: |
+          curl -sf "https://proxy.golang.org/github.com/ndmt1at21/tickr/@v/${GITHUB_REF_NAME}.info" \
+            || echo "pkg.go.dev fetch will happen on first import; ignoring non-zero exit"

@@ -1,0 +1,189 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Enqueue rate",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(tickr_messages_enqueued_total{job=~\"$job\"}[1m]))",
+          "legendFormat": "msg/s"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"] } },
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "type": "stat",
+      "title": "Success rate",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(tickr_handler_attempts_total{job=~\"$job\",outcome=\"success\"}[1m]))",
+          "legendFormat": "ok/s"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "type": "stat",
+      "title": "DLQ rate",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(rate(tickr_messages_dead_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "dead/s"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 0.01 },
+              { "color": "red", "value": 0.1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "type": "stat",
+      "title": "Inflight handlers",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "expr": "sum(tickr_inflight_handlers{job=~\"$job\"})",
+          "legendFormat": "inflight"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Handler outcomes (per event_type)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "expr": "sum by (event_type, outcome) (rate(tickr_handler_attempts_total{job=~\"$job\"}[1m]))",
+          "legendFormat": "{{event_type}} {{outcome}}"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Handler duration p50 / p95 / p99",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(tickr_handler_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tickr_handler_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(tickr_handler_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p99"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Queue depth by status",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum by (status) (tickr_queue_depth{job=~\"$job\"})",
+          "legendFormat": "{{status}}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Lease reclaim rate (worker crash signal)",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "sum(rate(tickr_leases_reclaimed_total{job=~\"$job\"}[5m]))",
+          "legendFormat": "reclaimed/s"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "type": "timeseries",
+      "title": "Claim batch fill ratio",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(tickr_claim_batch_size_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p95 batch size"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Claim query duration",
+      "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(tickr_claim_duration_seconds_bucket{job=~\"$job\"}[5m])))",
+          "legendFormat": "p99 claim duration"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "s" } }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": ["tickr"],
+  "templating": {
+    "list": [
+      {
+        "name": "DS_PROMETHEUS",
+        "type": "datasource",
+        "label": "Prometheus",
+        "query": "prometheus"
+      },
+      {
+        "name": "job",
+        "type": "query",
+        "label": "Job",
+        "datasource": { "type": "prometheus", "uid": "${DS_PROMETHEUS}" },
+        "query": "label_values(tickr_messages_enqueued_total, job)",
+        "refresh": 2,
+        "includeAll": true,
+        "multi": true
+      }
+    ]
+  },
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "",
+  "title": "tickr",
+  "uid": "tickr",
+  "version": 1,
+  "weekStart": ""
+}
