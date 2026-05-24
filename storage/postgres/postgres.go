@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"io/fs"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"time"
@@ -22,6 +23,22 @@ import (
 
 	"github.com/ndmt1at21/tickr"
 )
+
+// numClaimShards is the fan-out for the (shard, event_type, process_at, id)
+// partial index. Each enqueue picks a random shard, and each Claim targets one
+// random shard per call — splitting the head-of-index hot spot into N
+// independent ones when a burst of messages lands with near-identical
+// process_at values.
+//
+// Tradeoffs:
+//   - global FIFO is replaced by per-shard FIFO (acceptable for outbox-style
+//     workloads where ordering within a logical key is enforced by the
+//     producer, not the queue).
+//   - 16 is enough headroom for ~hundreds of concurrent workers without
+//     re-introducing the hot spot, and keeps the partial index small.
+const numClaimShards = 16
+
+func pickShard() int16 { return int16(rand.IntN(numClaimShards)) }
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -212,9 +229,9 @@ const messageReturnCols = `id, event_type, payload, headers, idempotency_key,
 const enqueueSQL = `
 INSERT INTO tickr_messages
     (id, event_type, payload, headers, idempotency_key, status,
-     attempt, max_attempts, process_at, created_at, updated_at)
+     attempt, max_attempts, process_at, shard, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, 'CREATED',
-        0, $6, $7, now(), now())
+        0, $6, $7, $8, now(), now())
 ON CONFLICT (event_type, idempotency_key) WHERE idempotency_key IS NOT NULL
     DO NOTHING
 RETURNING ` + messageReturnCols
@@ -223,9 +240,9 @@ RETURNING ` + messageReturnCols
 const enqueueSQLPartitioned = `
 INSERT INTO tickr_messages
     (id, event_type, payload, headers, idempotency_key, status,
-     attempt, max_attempts, process_at, created_at, updated_at)
+     attempt, max_attempts, process_at, shard, created_at, updated_at)
 VALUES ($1, $2, $3, $4, $5, 'CREATED',
-        0, $6, $7, now(), now())
+        0, $6, $7, $8, now(), now())
 ON CONFLICT (event_type, idempotency_key, created_at) WHERE idempotency_key IS NOT NULL
     DO NOTHING
 RETURNING ` + messageReturnCols
@@ -275,7 +292,7 @@ func (s *Store) Enqueue(ctx context.Context, tx tickr.Tx, p tickr.EnqueueParams)
 
 	row := q.QueryRow(ctx, s.insertSQL(),
 		id, p.EventType, p.Payload, encodeHeaders(p.Headers),
-		idemArg, maxAttempts, processAt)
+		idemArg, maxAttempts, processAt, pickShard())
 	msg, err := scanMessage(row)
 	if err == nil {
 		if nerr := s.notifyEnqueue(ctx, tx, p.EventType); nerr != nil {
@@ -350,7 +367,7 @@ func (s *Store) EnqueueBatch(ctx context.Context, tx tickr.Tx, ps []tickr.Enqueu
 		}
 		batch.Queue(s.insertSQL(),
 			id, p.EventType, p.Payload, encodeHeaders(p.Headers),
-			idemArg, maxAttempts, processAt)
+			idemArg, maxAttempts, processAt, pickShard())
 	}
 	br := q.SendBatch(ctx, batch)
 	defer func() { _ = br.Close() }()
@@ -412,11 +429,17 @@ func (s *Store) EnqueueBatch(ctx context.Context, tx tickr.Tx, ps []tickr.Enqueu
 
 // --- Claim ------------------------------------------------------------------
 
+// claimSQL uses a nullable shard parameter: when $5 is a smallint, the planner
+// uses the leading column of tickr_msg_claim_idx and stays on one B-tree
+// subtree (the burst-friendly path). When $5 is NULL the predicate degenerates
+// to TRUE and the same partial index is scanned across all shards (the
+// sparse-load fallback).
 const claimSQL = `
 WITH eligible AS (
     SELECT id
     FROM   tickr_messages
     WHERE  status IN ('CREATED','RETRYING')
+      AND  ($5::smallint IS NULL OR shard = $5::smallint)
       AND  process_at <= now()
       AND  ($1::text[] IS NULL OR event_type = ANY($1))
     ORDER BY process_at, id
@@ -434,7 +457,11 @@ WHERE  m.id = e.id
 RETURNING m.id, m.event_type, m.payload, m.headers, m.idempotency_key,
 	m.status, m.attempt, m.max_attempts, m.process_at, m.created_at, m.last_error`
 
-// Claim implements tickr.Storage.
+// Claim implements tickr.Storage. Two-pass to balance contention vs. latency:
+//  1. Targeted scan of one random shard. Under burst load this fills the batch
+//     while leaving the other 15 shards available to other workers.
+//  2. If pass 1 returned nothing, retry across all shards so sparse-load
+//     workloads (where most shards are empty) don't pay 16x poll latency.
 func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.InboundMessage, error) {
 	if p.Batch <= 0 {
 		p.Batch = 1
@@ -447,33 +474,46 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 	if len(p.EventTypes) > 0 {
 		eventTypes = p.EventTypes
 	}
+	leaseArg := fmt.Sprintf("%d", leaseSec)
 
-	rows, err := s.pool.Query(ctx, claimSQL, eventTypes, p.Batch, p.WorkerID, fmt.Sprintf("%d", leaseSec))
+	out, err := s.claimQuery(ctx, eventTypes, p.Batch, p.WorkerID, leaseArg, pickShard())
 	if err != nil {
-		return nil, fmt.Errorf("tickr/postgres: claim: %w", err)
+		return nil, err
 	}
-	defer rows.Close()
-
-	out := make([]*tickr.InboundMessage, 0, p.Batch)
-	for rows.Next() {
-		msg, err := scanMessage(rows)
+	if len(out) == 0 {
+		out, err = s.claimQuery(ctx, eventTypes, p.Batch, p.WorkerID, leaseArg, nil)
 		if err != nil {
-			return nil, fmt.Errorf("tickr/postgres: claim scan: %w", err)
+			return nil, err
 		}
-		// Append HANDLING history row inline (best-effort; not in same tx
-		// intentionally so a hang here doesn't block the claim).
-		out = append(out, msg)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("tickr/postgres: claim rows: %w", err)
 	}
 
 	// Append a CREATED/RETRYING → HANDLING history row per claimed message.
 	if len(out) > 0 {
 		if err := s.appendHistoryBatch(ctx, out, tickr.StatusHandling, "", p.WorkerID); err != nil {
-			// History best-effort; log via returned err — engine logs it.
 			return out, fmt.Errorf("tickr/postgres: claim history: %w", err)
 		}
+	}
+	return out, nil
+}
+
+// claimQuery runs the claim CTE once. shard==nil means "scan all shards".
+func (s *Store) claimQuery(ctx context.Context, eventTypes any, batch int, workerID, leaseArg string, shard any) ([]*tickr.InboundMessage, error) {
+	rows, err := s.pool.Query(ctx, claimSQL, eventTypes, batch, workerID, leaseArg, shard)
+	if err != nil {
+		return nil, fmt.Errorf("tickr/postgres: claim: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]*tickr.InboundMessage, 0, batch)
+	for rows.Next() {
+		msg, err := scanMessage(rows)
+		if err != nil {
+			return nil, fmt.Errorf("tickr/postgres: claim scan: %w", err)
+		}
+		out = append(out, msg)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("tickr/postgres: claim rows: %w", err)
 	}
 	return out, nil
 }

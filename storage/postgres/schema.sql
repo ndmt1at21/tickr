@@ -15,6 +15,7 @@ CREATE TABLE tickr_messages (
     attempt         INT          NOT NULL DEFAULT 0,
     max_attempts    INT          NOT NULL DEFAULT 10,
     process_at      TIMESTAMPTZ  NOT NULL,
+    shard           SMALLINT     NOT NULL,
     claimed_until   TIMESTAMPTZ,
     claimed_by      TEXT,
     last_error      TEXT,
@@ -23,7 +24,10 @@ CREATE TABLE tickr_messages (
     completed_at    TIMESTAMPTZ
 );
 
-CREATE INDEX tickr_msg_claim_idx  ON tickr_messages (event_type, process_at, id) WHERE status IN ('CREATED','RETRYING');
+-- The leading `shard` column splits the head of the claim index across N
+-- subtrees. Producers write a random shard per row; the claim path picks one
+-- shard per call, falling back to a full scan if that shard is empty.
+CREATE INDEX tickr_msg_claim_idx  ON tickr_messages (shard, event_type, process_at, id) WHERE status IN ('CREATED','RETRYING');
 CREATE INDEX tickr_msg_lease_idx  ON tickr_messages (claimed_until)              WHERE status = 'HANDLING';
 CREATE UNIQUE INDEX tickr_msg_idem_idx ON tickr_messages (event_type, idempotency_key) WHERE idempotency_key IS NOT NULL;
 CREATE INDEX tickr_msg_dead_idx   ON tickr_messages (event_type, completed_at DESC) WHERE status = 'DEAD';

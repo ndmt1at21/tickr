@@ -10,13 +10,17 @@ CREATE TABLE tickr_messages (
     attempt         INT          NOT NULL DEFAULT 0,
     max_attempts    INT          NOT NULL DEFAULT 10,
     process_at      DATETIME(6)  NOT NULL,
+    shard           TINYINT      NOT NULL,
     claimed_until   DATETIME(6),
     claimed_by      VARCHAR(255),
     last_error      TEXT,
     created_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     updated_at      DATETIME(6)  NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
     completed_at    DATETIME(6),
-    INDEX tickr_msg_claim_idx (status, event_type, process_at, id),
+    -- The `shard` leading column splits the B-tree head across N subtrees so
+    -- a burst of inserts with near-identical process_at values doesn't pile
+    -- up in one hot leaf. See mysql.go (numClaimShards).
+    INDEX tickr_msg_claim_idx (shard, status, event_type, process_at, id),
     INDEX tickr_msg_lease_idx (status, claimed_until),
     INDEX tickr_msg_dead_idx (status, event_type, completed_at),
     INDEX tickr_msg_purge_idx (status, completed_at),

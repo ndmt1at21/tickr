@@ -14,6 +14,7 @@ CREATE TABLE tickr_messages (
     attempt         INT          NOT NULL DEFAULT 0,
     max_attempts    INT          NOT NULL DEFAULT 10,
     process_at      TIMESTAMPTZ  NOT NULL,
+    shard           SMALLINT     NOT NULL,
     claimed_until   TIMESTAMPTZ,
     claimed_by      TEXT,
     last_error      TEXT,
@@ -23,9 +24,12 @@ CREATE TABLE tickr_messages (
 );
 
 -- Partial claim index: only pending rows live in this index, keeping it
--- small even at multi-million-row table sizes.
+-- small even at multi-million-row table sizes. The `shard` leading column
+-- splits the B-tree head across N subtrees so a burst of inserts with
+-- near-identical process_at values doesn't pile up in one hot leaf — see
+-- postgres.go (numClaimShards) for the producer / claim-path counterpart.
 CREATE INDEX tickr_msg_claim_idx
-    ON tickr_messages (event_type, process_at, id)
+    ON tickr_messages (shard, event_type, process_at, id)
     WHERE status IN ('CREATED','RETRYING');
 
 -- Lease-expiry index for the reclaimer.

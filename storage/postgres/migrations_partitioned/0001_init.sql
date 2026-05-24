@@ -25,6 +25,7 @@ CREATE TABLE tickr_messages (
     attempt         INT          NOT NULL DEFAULT 0,
     max_attempts    INT          NOT NULL DEFAULT 10,
     process_at      TIMESTAMPTZ  NOT NULL,
+    shard           SMALLINT     NOT NULL,
     claimed_until   TIMESTAMPTZ,
     claimed_by      TEXT,
     last_error      TEXT,
@@ -40,8 +41,9 @@ CREATE TABLE tickr_messages (
 -- DROP PARTITION (you'd need DELETE) — treat its size as a warning signal.
 CREATE TABLE tickr_messages_default PARTITION OF tickr_messages DEFAULT;
 
+-- Sharded claim index — see migrations/0001_init.sql for the design note.
 CREATE INDEX tickr_msg_claim_idx
-    ON tickr_messages (event_type, process_at, id)
+    ON tickr_messages (shard, event_type, process_at, id)
     WHERE status IN ('CREATED','RETRYING');
 
 CREATE INDEX tickr_msg_lease_idx

@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math/rand/v2"
 	"sort"
 	"strings"
 	"time"
@@ -23,6 +24,12 @@ import (
 
 	"github.com/ndmt1at21/tickr"
 )
+
+// numClaimShards mirrors the Postgres adapter's split — see
+// storage/postgres/postgres.go for the design rationale.
+const numClaimShards = 16
+
+func pickShard() int8 { return int8(rand.IntN(numClaimShards)) }
 
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
@@ -138,9 +145,9 @@ func scanMessage(row rowScanner) (*tickr.InboundMessage, error) {
 const enqueueSQL = `
 INSERT INTO tickr_messages
     (id, event_type, payload, headers, idempotency_key, status,
-     attempt, max_attempts, process_at, created_at, updated_at)
+     attempt, max_attempts, process_at, shard, created_at, updated_at)
 VALUES (?, ?, ?, ?, ?, 'CREATED',
-        0, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))`
+        0, ?, ?, ?, CURRENT_TIMESTAMP(6), CURRENT_TIMESTAMP(6))`
 
 const findByIdemSQL = `
 SELECT ` + messageReturnCols + `
@@ -171,7 +178,7 @@ func (s *Store) Enqueue(ctx context.Context, tx tickr.Tx, p tickr.EnqueueParams)
 
 	_, err := ex.ExecContext(ctx, enqueueSQL,
 		id, p.EventType, p.Payload, encodeHeaders(p.Headers),
-		idemArg, maxAttempts, processAt)
+		idemArg, maxAttempts, processAt, pickShard())
 	if err != nil {
 		if isDuplicateErr(err) && p.IdempotencyKey != "" {
 			existing, ferr := s.findByIdempotency(ctx, ex, p.EventType, p.IdempotencyKey)
@@ -236,6 +243,10 @@ func isDuplicateErr(err error) bool {
 //
 // database/sql doesn't give us a portable RETURNING, so we use a two-step
 // (SELECT FOR UPDATE SKIP LOCKED → UPDATE) within a tx.
+//
+// Two-pass shard selection: first targets one random shard to keep B-tree
+// head contention split during bursts; if empty, falls back to scanning all
+// shards so sparse loads don't pay 16x poll latency.
 func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.InboundMessage, error) {
 	if p.Batch <= 0 {
 		p.Batch = 100
@@ -250,37 +261,16 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	placeholders := strings.Repeat("?,", len(p.EventTypes))
-	placeholders = placeholders[:len(placeholders)-1]
-	args := make([]any, 0, len(p.EventTypes)+2)
-	for _, et := range p.EventTypes {
-		args = append(args, et)
-	}
-	args = append(args, time.Now(), p.Batch)
-
-	selectSQL := fmt.Sprintf(`
-        SELECT id FROM tickr_messages
-        WHERE status IN ('CREATED','RETRYING')
-          AND event_type IN (%s)
-          AND process_at <= ?
-        ORDER BY process_at, id
-        LIMIT ?
-        FOR UPDATE SKIP LOCKED`, placeholders)
-
-	rows, err := tx.QueryContext(ctx, selectSQL, args...)
+	ids, err := selectClaimIDs(ctx, tx, p, pickShard())
 	if err != nil {
-		return nil, fmt.Errorf("tickr/mysql: claim select: %w", err)
+		return nil, err
 	}
-	var ids []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
+	if len(ids) == 0 {
+		ids, err = selectClaimIDs(ctx, tx, p, nil)
+		if err != nil {
 			return nil, err
 		}
-		ids = append(ids, id)
 	}
-	_ = rows.Close()
 	if len(ids) == 0 {
 		return nil, tx.Commit()
 	}
@@ -338,6 +328,50 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 		return nil, fmt.Errorf("tickr/mysql: claim commit: %w", err)
 	}
 	return out, nil
+}
+
+// selectClaimIDs runs one SELECT ... FOR UPDATE SKIP LOCKED inside tx. When
+// shard is non-nil it constrains the scan to a single shard subtree; nil
+// scans across all shards (the sparse-load fallback).
+func selectClaimIDs(ctx context.Context, tx *sql.Tx, p tickr.ClaimParams, shard any) ([]string, error) {
+	placeholders := strings.Repeat("?,", len(p.EventTypes))
+	placeholders = placeholders[:len(placeholders)-1]
+
+	args := make([]any, 0, len(p.EventTypes)+3)
+	shardClause := ""
+	if shard != nil {
+		shardClause = "AND shard = ? "
+		args = append(args, shard)
+	}
+	for _, et := range p.EventTypes {
+		args = append(args, et)
+	}
+	args = append(args, time.Now(), p.Batch)
+
+	selectSQL := fmt.Sprintf(`
+        SELECT id FROM tickr_messages
+        WHERE status IN ('CREATED','RETRYING')
+          %s
+          AND event_type IN (%s)
+          AND process_at <= ?
+        ORDER BY process_at, id
+        LIMIT ?
+        FOR UPDATE SKIP LOCKED`, shardClause, placeholders)
+
+	rows, err := tx.QueryContext(ctx, selectSQL, args...)
+	if err != nil {
+		return nil, fmt.Errorf("tickr/mysql: claim select: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }
 
 func appendHistory(ctx context.Context, ex execer, id tickr.MessageID, from, to string, attempt int, errStr, workerID string) {

@@ -13,11 +13,11 @@ import (
 // dispatch + commit paths exercise. Methods not called by these tests
 // return zero values.
 type fakeEngineStore struct {
-	mu       sync.Mutex
-	toClaim  []*InboundMessage
-	claimed  bool
-	succeed  []MessageID
-	failed   []FailParams
+	mu      sync.Mutex
+	toClaim []*InboundMessage
+	claimed bool
+	succeed []MessageID
+	failed  []FailParams
 }
 
 func (f *fakeEngineStore) Claim(_ context.Context, _ ClaimParams) ([]*InboundMessage, error) {
@@ -61,13 +61,13 @@ func (f *fakeEngineStore) History(context.Context, MessageID) ([]Transition, err
 func (f *fakeEngineStore) ListDead(context.Context, string, time.Time, int) ([]*InboundMessage, error) {
 	return nil, nil
 }
-func (f *fakeEngineStore) Requeue(context.Context, MessageID, time.Time) error    { return nil }
-func (f *fakeEngineStore) ReclaimExpired(context.Context, int) (int64, error)     { return 0, nil }
+func (f *fakeEngineStore) Requeue(context.Context, MessageID, time.Time) error { return nil }
+func (f *fakeEngineStore) ReclaimExpired(context.Context, int) (int64, error)  { return 0, nil }
 func (f *fakeEngineStore) PurgeTerminal(context.Context, time.Time, int) (int64, error) {
 	return 0, nil
 }
-func (f *fakeEngineStore) Stats(context.Context) (Stats, error)         { return Stats{}, nil }
-func (f *fakeEngineStore) ApplyMigrations(context.Context) error        { return nil }
+func (f *fakeEngineStore) Stats(context.Context) (Stats, error)  { return Stats{}, nil }
+func (f *fakeEngineStore) ApplyMigrations(context.Context) error { return nil }
 func (f *fakeEngineStore) TryLeaderLock(context.Context, string) (bool, func(), error) {
 	return false, func() {}, nil
 }
@@ -95,7 +95,7 @@ func TestEngine_BatchHandler_AllSucceed(t *testing.T) {
 	}}
 	reg := NewRegistry()
 	var (
-		mu        sync.Mutex
+		mu          sync.Mutex
 		invocations [][]MessageID
 	)
 	if err := reg.OnBatch("batch.evt", func(_ context.Context, msgs []*InboundMessage) error {
