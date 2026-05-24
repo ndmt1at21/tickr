@@ -114,3 +114,71 @@ func TestMustOn_NilPanics(t *testing.T) {
 	reg := NewRegistry()
 	MustOn[fooBody](reg, "x", nil)
 }
+
+func TestOnBatchTyped_DecodesAll(t *testing.T) {
+	reg := NewRegistry()
+	var seen []fooBody
+	if err := OnBatch(reg, "foo.batch",
+		func(_ context.Context, batch []BatchItem[fooBody]) error {
+			for _, it := range batch {
+				seen = append(seen, it.Body)
+				if it.Msg == nil {
+					t.Fatal("BatchItem.Msg must be set")
+				}
+			}
+			return nil
+		}); err != nil {
+		t.Fatalf("OnBatch: %v", err)
+	}
+	regEntry, _ := reg.lookup("foo.batch")
+	a, _ := json.Marshal(fooBody{Name: "alice", Count: 1})
+	b, _ := json.Marshal(fooBody{Name: "bob", Count: 2})
+	msgs := []*InboundMessage{
+		{ID: "1", Type: "foo.batch", Payload: a},
+		{ID: "2", Type: "foo.batch", Payload: b},
+	}
+	if err := regEntry.batchHandler(context.Background(), msgs); err != nil {
+		t.Fatalf("invoke: %v", err)
+	}
+	if len(seen) != 2 || seen[0].Name != "alice" || seen[1].Name != "bob" {
+		t.Fatalf("decoded = %+v", seen)
+	}
+}
+
+func TestOnBatchTyped_BadPayloadDeadLettersBatch(t *testing.T) {
+	reg := NewRegistry()
+	called := false
+	if err := OnBatch(reg, "foo.batch.bad",
+		func(_ context.Context, _ []BatchItem[fooBody]) error {
+			called = true
+			return nil
+		}); err != nil {
+		t.Fatalf("OnBatch: %v", err)
+	}
+	regEntry, _ := reg.lookup("foo.batch.bad")
+	good, _ := json.Marshal(fooBody{Name: "ok"})
+	msgs := []*InboundMessage{
+		{ID: "1", Type: "foo.batch.bad", Payload: good},
+		{ID: "2", Type: "foo.batch.bad", Payload: []byte("not json")},
+	}
+	err := regEntry.batchHandler(context.Background(), msgs)
+	if err == nil {
+		t.Fatal("expected decode error, got nil")
+	}
+	if !IsDeadLetter(err) {
+		t.Fatalf("want dead-letter, got %v", err)
+	}
+	if called {
+		t.Error("handler should not run when any payload fails to decode")
+	}
+}
+
+func TestMustOnBatch_NilPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("expected panic")
+		}
+	}()
+	reg := NewRegistry()
+	MustOnBatch[fooBody](reg, "x", nil)
+}

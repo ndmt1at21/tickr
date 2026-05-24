@@ -140,37 +140,91 @@ func (e *engine) pollOnce(ctx context.Context) int {
 	}
 	e.cfg.metrics.ClaimBatch(len(msgs), batchSizeOrDefault(e.cfg.batchSize), time.Since(start))
 
+	// Partition into single-message dispatches and per-type batch groups.
+	// Same-type batch messages run in one all-or-nothing handler invocation.
+	var batchByType map[string][]*InboundMessage
 	for _, m := range msgs {
+		reg, ok := e.cfg.registry.lookup(m.Type)
+		if !ok {
+			e.failNoHandler(ctx, m)
+			continue
+		}
+		if reg.batchHandler != nil {
+			if batchByType == nil {
+				batchByType = map[string][]*InboundMessage{}
+			}
+			batchByType[m.Type] = append(batchByType[m.Type], m)
+			continue
+		}
+		e.dispatchSingle(ctx, m, reg)
+	}
+
+	for et, group := range batchByType {
+		reg, _ := e.cfg.registry.lookup(et)
+		e.dispatchBatches(ctx, group, reg)
+	}
+	return len(msgs)
+}
+
+func (e *engine) dispatchSingle(ctx context.Context, m *InboundMessage, reg registration) {
+	select {
+	case e.globalPool <- struct{}{}:
+	case <-ctx.Done():
+		e.releaseForShutdown(context.Background(), m, "shutdown before dispatch")
+		return
+	}
+
+	var perType chan struct{}
+	if reg.cfg.maxInflight > 0 {
+		perType = e.semaphore(m.Type, reg.cfg.maxInflight)
+		select {
+		case perType <- struct{}{}:
+		case <-ctx.Done():
+			<-e.globalPool
+			e.releaseForShutdown(context.Background(), m, "shutdown before dispatch")
+			return
+		}
+	}
+
+	e.inflight.Add(1)
+	go e.runHandler(ctx, m, reg, perType)
+}
+
+func (e *engine) dispatchBatches(ctx context.Context, msgs []*InboundMessage, reg registration) {
+	chunkSize := reg.cfg.maxBatchSize
+	if chunkSize <= 0 || chunkSize > len(msgs) {
+		chunkSize = len(msgs)
+	}
+	for i := 0; i < len(msgs); i += chunkSize {
+		end := min(i+chunkSize, len(msgs))
+		chunk := msgs[i:end]
+
 		select {
 		case e.globalPool <- struct{}{}:
 		case <-ctx.Done():
-			e.releaseForShutdown(context.Background(), m, "shutdown before dispatch")
-			continue
-		}
-
-		reg, ok := e.cfg.registry.lookup(m.Type)
-		if !ok {
-			<-e.globalPool
-			e.failNoHandler(ctx, m)
+			for _, m := range chunk {
+				e.releaseForShutdown(context.Background(), m, "shutdown before dispatch")
+			}
 			continue
 		}
 
 		var perType chan struct{}
 		if reg.cfg.maxInflight > 0 {
-			perType = e.semaphore(m.Type, reg.cfg.maxInflight)
+			perType = e.semaphore(chunk[0].Type, reg.cfg.maxInflight)
 			select {
 			case perType <- struct{}{}:
 			case <-ctx.Done():
 				<-e.globalPool
-				e.releaseForShutdown(context.Background(), m, "shutdown before dispatch")
+				for _, m := range chunk {
+					e.releaseForShutdown(context.Background(), m, "shutdown before dispatch")
+				}
 				continue
 			}
 		}
 
 		e.inflight.Add(1)
-		go e.runHandler(ctx, m, reg, perType)
+		go e.runBatchHandler(ctx, chunk, reg, perType)
 	}
-	return len(msgs)
 }
 
 func (e *engine) semaphore(eventType string, capacity int) chan struct{} {
@@ -238,6 +292,83 @@ func (e *engine) runHandler(parentCtx context.Context, m *InboundMessage, reg re
 	completionCtx, completionCancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer completionCancel()
 	e.commitOutcome(completionCtx, m, reg.cfg, err, outcome)
+}
+
+// runBatchHandler is the all-or-nothing counterpart to runHandler: one
+// invocation processes a slice of same-type messages, then the resolved
+// outcome is committed once per message.
+func (e *engine) runBatchHandler(parentCtx context.Context, msgs []*InboundMessage, reg registration, perType chan struct{}) {
+	defer e.inflight.Done()
+	defer func() { <-e.globalPool }()
+	if perType != nil {
+		defer func() { <-perType }()
+	}
+
+	timeout := reg.cfg.attemptTimeout
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	attemptCtx, cancel := context.WithTimeout(parentCtx, timeout)
+	defer cancel()
+
+	extenderDone := make(chan struct{})
+	go e.extendBatchLoop(parentCtx, msgs, attemptCtx, cancel, extenderDone)
+	defer close(extenderDone)
+
+	// Trace span scoped to the first message; otel impl extracts traceparent
+	// from headers, which won't be uniform across a batch — pick a
+	// representative one. Per-message metrics still fire below.
+	handlerCtx, endSpan := e.cfg.tracer.StartHandlerSpan(attemptCtx, msgs[0])
+
+	for _, m := range msgs {
+		e.cfg.metrics.HandlerStarted(m.Type, m.Attempt)
+	}
+	start := time.Now()
+
+	err := safeInvokeBatch(reg.batchHandler, handlerCtx, msgs)
+	duration := time.Since(start)
+
+	endSpan(err)
+
+	outcome := e.resolveOutcome(parentCtx, err)
+	for _, m := range msgs {
+		e.cfg.metrics.HandlerCompleted(m.Type, m.Attempt, duration, outcome)
+	}
+
+	completionCtx, completionCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer completionCancel()
+	for _, m := range msgs {
+		e.commitOutcome(completionCtx, m, reg.cfg, err, outcome)
+	}
+}
+
+func (e *engine) extendBatchLoop(parentCtx context.Context, msgs []*InboundMessage, attemptCtx context.Context, cancel context.CancelFunc, done <-chan struct{}) {
+	lease := leaseOrDefault(e.cfg.lease)
+	interval := max(lease/3, 100*time.Millisecond)
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-done:
+			return
+		case <-attemptCtx.Done():
+			return
+		case <-t.C:
+			until := time.Now().Add(lease)
+			for _, m := range msgs {
+				ok, err := e.cfg.storage.Extend(parentCtx, m.ID, e.cfg.workerID, until)
+				if err != nil {
+					e.cfg.logger.Warn(parentCtx, "tickr: extend lease errored", "message_id", m.ID, "err", err)
+					continue
+				}
+				if !ok {
+					e.cfg.logger.Warn(parentCtx, "tickr: lease lost in batch, cancelling attempt", "message_id", m.ID)
+					cancel()
+					return
+				}
+			}
+		}
+	}
 }
 
 func (e *engine) extendLoop(parentCtx context.Context, m *InboundMessage, attemptCtx context.Context, cancel context.CancelFunc, done <-chan struct{}) {
@@ -343,6 +474,19 @@ func safeInvoke(h Handler, ctx context.Context, m *InboundMessage) (err error) {
 		}
 	}()
 	return h(ctx, m)
+}
+
+func safeInvokeBatch(h BatchHandler, ctx context.Context, msgs []*InboundMessage) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			if e, ok := r.(error); ok {
+				err = fmt.Errorf("tickr: batch handler panic: %w", e)
+			} else {
+				err = fmt.Errorf("tickr: batch handler panic: %v", r)
+			}
+		}
+	}()
+	return h(ctx, msgs)
 }
 
 func batchSizeOrDefault(n int) int {

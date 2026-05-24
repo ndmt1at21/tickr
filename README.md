@@ -81,6 +81,32 @@ _ = w.Start(ctx) // blocks until ctx is cancelled
 Drop down to `reg.On(eventType, tickr.Handler, …)` when you need raw
 `[]byte` access or a non-JSON codec.
 
+### Batch handlers
+
+Process same-type messages in groups when the downstream work batches
+naturally (bulk inserts, bulk-API calls). `tickr.OnBatch[T]` registers an
+all-or-nothing handler: returning `nil` marks every message in the batch
+SUCCESS; a non-nil error fails the whole batch with the same error
+(each message retries on its own attempt count).
+
+```go
+_ = tickr.OnBatch(reg, "order.created",
+    func(ctx context.Context, batch []tickr.BatchItem[OrderCreated]) error {
+        rows := make([]OrderCreated, len(batch))
+        for i, it := range batch {
+            rows[i] = it.Body
+        }
+        return db.BulkInsert(ctx, rows)
+    },
+    tickr.WithMaxBatchSize(100),
+    tickr.WithAttemptTimeout(30*time.Second),
+)
+```
+
+The worker groups same-type messages from each claim cycle and chunks
+them by `WithMaxBatchSize` (zero = the whole group in one call). Use
+`reg.OnBatch(eventType, tickr.BatchHandler, …)` for raw `[]byte` access.
+
 ## Migrations
 
 ```go
