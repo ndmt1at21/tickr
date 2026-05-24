@@ -37,7 +37,6 @@ import (
 	tprom "github.com/ndmt1at21/tickr/metrics/prom"
 	pgstore "github.com/ndmt1at21/tickr/storage/postgres"
 	totel "github.com/ndmt1at21/tickr/tracing/otel"
-	"github.com/ndmt1at21/tickr/ui"
 )
 
 type orderCreated struct {
@@ -136,8 +135,6 @@ func main() {
 	// --- HTTP --------------------------------------------------------------
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.HandlerFor(promReg, promhttp.HandlerOpts{}))
-	// Embedded admin dashboard — browse messages, retry/kill, view history.
-	mux.Handle("/tickr/", http.StripPrefix("/tickr", ui.Handler(store, ui.Options{Title: "orders"})))
 	mux.HandleFunc("/orders", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

@@ -75,10 +75,9 @@ type InboundMessage struct {
 	// first attempt.
 	LastError string
 
-	// Status is the row's lifecycle status at the time it was read.
-	// Populated by [Admin.List] and [Admin.Get]; on the [Handler] hot path
-	// it is always [StatusHandling] (set by the claim) and handlers can
-	// safely ignore it.
+	// Status is the row's lifecycle status at the time it was read. On the
+	// [Handler] hot path it is always [StatusHandling] (set by the claim)
+	// and handlers can safely ignore it.
 	Status Status
 }
 
