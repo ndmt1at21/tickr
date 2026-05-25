@@ -28,6 +28,7 @@ type engineConfig struct {
 	logger  Logger
 	metrics Metrics
 	tracer  Tracer
+	alerter Alerter
 }
 
 // engine drives the claim loop, dispatches handlers, and manages the lease
@@ -136,6 +137,7 @@ func (e *engine) pollOnce(ctx context.Context) int {
 	end(err)
 	if err != nil {
 		e.cfg.logger.Error(ctx, "tickr: claim failed", err)
+		fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{Kind: ErrorKindClaim, Err: err})
 		return 0
 	}
 	e.cfg.metrics.ClaimBatch(len(msgs), batchSizeOrDefault(e.cfg.batchSize), time.Since(start))
@@ -249,6 +251,13 @@ func (e *engine) failNoHandler(ctx context.Context, m *InboundMessage) {
 		Dead:      true,
 	})
 	e.cfg.metrics.MessageDead(m.Type)
+	fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
+		Kind:      ErrorKindNoHandler,
+		EventType: m.Type,
+		MessageID: m.ID,
+		Attempt:   m.Attempt,
+		Err:       err,
+	})
 }
 
 func (e *engine) releaseForShutdown(ctx context.Context, m *InboundMessage, reason string) {
@@ -359,10 +368,24 @@ func (e *engine) extendBatchLoop(parentCtx context.Context, msgs []*InboundMessa
 				ok, err := e.cfg.storage.Extend(parentCtx, m.ID, e.cfg.workerID, until)
 				if err != nil {
 					e.cfg.logger.Warn(parentCtx, "tickr: extend lease errored", "message_id", m.ID, "err", err)
+					fireAlert(e.cfg.alerter, e.cfg.logger, parentCtx, ErrorEvent{
+						Kind:      ErrorKindLease,
+						EventType: m.Type,
+						MessageID: m.ID,
+						Attempt:   m.Attempt,
+						Err:       err,
+					})
 					continue
 				}
 				if !ok {
 					e.cfg.logger.Warn(parentCtx, "tickr: lease lost in batch, cancelling attempt", "message_id", m.ID)
+					fireAlert(e.cfg.alerter, e.cfg.logger, parentCtx, ErrorEvent{
+						Kind:      ErrorKindLease,
+						EventType: m.Type,
+						MessageID: m.ID,
+						Attempt:   m.Attempt,
+						Err:       fmt.Errorf("lease lost"),
+					})
 					cancel()
 					return
 				}
@@ -386,10 +409,24 @@ func (e *engine) extendLoop(parentCtx context.Context, m *InboundMessage, attemp
 			ok, err := e.cfg.storage.Extend(parentCtx, m.ID, e.cfg.workerID, time.Now().Add(lease))
 			if err != nil {
 				e.cfg.logger.Warn(parentCtx, "tickr: extend lease errored", "message_id", m.ID, "err", err)
+				fireAlert(e.cfg.alerter, e.cfg.logger, parentCtx, ErrorEvent{
+					Kind:      ErrorKindLease,
+					EventType: m.Type,
+					MessageID: m.ID,
+					Attempt:   m.Attempt,
+					Err:       err,
+				})
 				continue
 			}
 			if !ok {
 				e.cfg.logger.Warn(parentCtx, "tickr: lease lost, cancelling attempt", "message_id", m.ID)
+				fireAlert(e.cfg.alerter, e.cfg.logger, parentCtx, ErrorEvent{
+					Kind:      ErrorKindLease,
+					EventType: m.Type,
+					MessageID: m.ID,
+					Attempt:   m.Attempt,
+					Err:       fmt.Errorf("lease lost"),
+				})
 				cancel()
 				return
 			}
@@ -415,10 +452,24 @@ func (e *engine) commitOutcome(ctx context.Context, m *InboundMessage, cfg handl
 	case OutcomeSuccess:
 		if serr := e.cfg.storage.Succeed(ctx, m.ID, m.Attempt, e.cfg.workerID); serr != nil {
 			e.cfg.logger.Error(ctx, "tickr: succeed failed", serr, "message_id", m.ID)
+			fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
+				Kind:      ErrorKindStorage,
+				EventType: m.Type,
+				MessageID: m.ID,
+				Attempt:   m.Attempt,
+				Err:       serr,
+			})
 		}
 	case OutcomeCanceled:
 		if rerr := e.cfg.storage.ReleaseShutdown(ctx, m.ID, m.Attempt, e.cfg.workerID, "worker shutdown"); rerr != nil {
 			e.cfg.logger.Error(ctx, "tickr: release-on-shutdown failed", rerr, "message_id", m.ID)
+			fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
+				Kind:      ErrorKindStorage,
+				EventType: m.Type,
+				MessageID: m.ID,
+				Attempt:   m.Attempt,
+				Err:       rerr,
+			})
 		}
 	case OutcomeRetry, OutcomeDead:
 		dead := outcome == OutcomeDead
@@ -459,7 +510,26 @@ func (e *engine) commitOutcome(ctx context.Context, m *InboundMessage, cfg handl
 		}
 		if ferr := e.cfg.storage.Fail(ctx, fail); ferr != nil {
 			e.cfg.logger.Error(ctx, "tickr: fail-write failed", ferr, "message_id", m.ID)
+			fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
+				Kind:      ErrorKindStorage,
+				EventType: m.Type,
+				MessageID: m.ID,
+				Attempt:   m.Attempt,
+				Err:       ferr,
+			})
 		}
+
+		kind := ErrorKindHandler
+		if dead {
+			kind = ErrorKindDeadLetter
+		}
+		fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
+			Kind:      kind,
+			EventType: m.Type,
+			MessageID: m.ID,
+			Attempt:   m.Attempt,
+			Err:       err,
+		})
 	}
 }
 

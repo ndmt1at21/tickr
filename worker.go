@@ -42,6 +42,7 @@ type WorkerConfig struct {
 	Logger  Logger
 	Metrics Metrics
 	Tracer  Tracer
+	Alerter Alerter
 
 	ReclaimInterval time.Duration // 0 => 5s
 
@@ -77,6 +78,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 	cfg.Logger = defaultedLogger(cfg.Logger)
 	cfg.Metrics = defaultedMetrics(cfg.Metrics)
 	cfg.Tracer = defaultedTracer(cfg.Tracer)
+	cfg.Alerter = defaultedAlerter(cfg.Alerter)
 
 	eng := newEngine(engineConfig{
 		storage:        cfg.Storage,
@@ -91,6 +93,7 @@ func NewWorker(cfg WorkerConfig) (*Worker, error) {
 		logger:         cfg.Logger,
 		metrics:        cfg.Metrics,
 		tracer:         cfg.Tracer,
+		alerter:        cfg.Alerter,
 	})
 
 	return &Worker{cfg: cfg, eng: eng}, nil
@@ -176,6 +179,7 @@ func (w *Worker) tryReclaim(ctx context.Context) {
 	acquired, unlock, err := w.cfg.Storage.TryLeaderLock(ctx, "tickr.reclaimer")
 	if err != nil {
 		w.cfg.Logger.Warn(ctx, "tickr: reclaimer leader lock errored", "err", err)
+		fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindReclaimer, Err: err})
 		return
 	}
 	if !acquired {
@@ -185,6 +189,7 @@ func (w *Worker) tryReclaim(ctx context.Context) {
 	n, err := w.cfg.Storage.ReclaimExpired(ctx, 500)
 	if err != nil {
 		w.cfg.Logger.Error(ctx, "tickr: reclaim failed", err)
+		fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindReclaimer, Err: err})
 		return
 	}
 	if n > 0 {
@@ -214,6 +219,7 @@ func (w *Worker) tryPurge(ctx context.Context) {
 	acquired, unlock, err := w.cfg.Storage.TryLeaderLock(ctx, "tickr.janitor")
 	if err != nil {
 		w.cfg.Logger.Warn(ctx, "tickr: janitor leader lock errored", "err", err)
+		fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindJanitor, Err: err})
 		return
 	}
 	if !acquired {
@@ -236,6 +242,7 @@ func (w *Worker) tryPurge(ctx context.Context) {
 		n, err := w.cfg.Storage.PurgeTerminal(ctx, successCutoff, batch)
 		if err != nil {
 			w.cfg.Logger.Error(ctx, "tickr: purge SUCCESS failed", err)
+			fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindJanitor, Err: err})
 			break
 		}
 		if n < int64(batch) {
@@ -258,6 +265,7 @@ func (w *Worker) tryPurge(ctx context.Context) {
 		n, err := w.cfg.Storage.PurgeTerminal(ctx, deadCutoff, batch)
 		if err != nil {
 			w.cfg.Logger.Error(ctx, "tickr: purge DEAD failed", err)
+			fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindJanitor, Err: err})
 			break
 		}
 		if n < int64(batch) {
