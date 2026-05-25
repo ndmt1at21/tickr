@@ -107,6 +107,56 @@ The worker groups same-type messages from each claim cycle and chunks
 them by `WithMaxBatchSize` (zero = the whole group in one call). Use
 `reg.OnBatch(eventType, tickr.BatchHandler, …)` for raw `[]byte` access.
 
+### Built-in transport handlers
+
+Two subpackages skip the boilerplate when the handler's only job is to
+forward the message to a downstream service. Each lives in its own Go
+module so its transport-specific deps stay out of the core `go.mod`.
+
+#### HTTP webhook — [`handlers/http`](handlers/http/)
+
+```go
+import httphandler "github.com/ndmt1at21/tickr/handlers/http"
+
+_ = tickr.On(reg, "email.send",
+    httphandler.PostJSON[Email](http.DefaultClient, httphandler.Config[Email]{
+        URLFunc: func(_ context.Context, _ *tickr.InboundMessage, e Email) string {
+            return e.HookURL
+        },
+    }),
+    tickr.WithMaxAttempts(8),
+    tickr.WithAttemptTimeout(15*time.Second),
+)
+```
+
+Defaults: 2xx → success; 4xx (except 408/425/429) → DeadLetter;
+408/425/429 + 5xx → retry (Retry-After honored); transport errors →
+retry. The message's `Headers` (W3C traceparent included) and
+`IdempotencyKey` are forwarded as HTTP headers automatically.
+Override classification or header forwarding via [`Config`](handlers/http/handler.go).
+
+#### gRPC unary — [`handlers/grpc`](handlers/grpc/)
+
+```go
+import grpchandler "github.com/ndmt1at21/tickr/handlers/grpc"
+
+client := userpb.NewUserServiceClient(conn)
+
+_ = tickr.On(reg, "user.signup",
+    grpchandler.Unary(client.Notify, grpchandler.Config[*userpb.NotifyRequest]{}),
+    tickr.WithMaxAttempts(5),
+    tickr.WithAttemptTimeout(10*time.Second),
+)
+```
+
+Defaults follow gRPC retry semantics: `UNAVAILABLE`, `DEADLINE_EXCEEDED`,
+`RESOURCE_EXHAUSTED`, `ABORTED` retry; `INVALID_ARGUMENT`, `NOT_FOUND`,
+`PERMISSION_DENIED`, `UNAUTHENTICATED`, `ALREADY_EXISTS`,
+`FAILED_PRECONDITION`, `OUT_OF_RANGE`, `UNIMPLEMENTED` DeadLetter;
+`INTERNAL` / `UNKNOWN` / `DATA_LOSS` retry by default (override via
+`Config.Classifier`). Trace context and idempotency key are attached as
+outgoing gRPC metadata.
+
 ## Migrations
 
 ```go
@@ -201,6 +251,13 @@ Span attributes follow the OpenTelemetry messaging semantic conventions.
 Import `grafana/tickr-dashboard.json`. See [grafana/README.md](grafana/README.md) for scrape config, alert rules, and Tempo/Jaeger deep-links by `messaging.message.id`.
 
 ## Throughput
+
+For head-to-head numbers against [River](https://github.com/riverqueue/river),
+[Gue](https://github.com/vgarvardt/gue),
+[Watermill SQL](https://github.com/ThreeDotsLabs/watermill-sql), and
+[Asynq](https://github.com/hibiken/asynq) on identical workloads, see
+[BENCHMARKS.md](BENCHMARKS.md). The bench code lives in
+[`benchmarks/`](benchmarks/) as a separate Go module.
 
 For 1M msg/min (16.7k/sec) sustained, the recommended baseline configuration is:
 

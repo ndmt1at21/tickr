@@ -46,8 +46,45 @@ var migrationsFS embed.FS
 //go:embed migrations_partitioned/*.sql
 var partitionedMigrationsFS embed.FS
 
+// HistoryPolicy controls whether the adapter writes per-transition rows
+// to tickr_history on the hot ack path.
+//
+// History rows are advisory (they back the History() admin API and
+// per-message debugging) — they are not load-bearing for correctness.
+// Disabling them removes one row write per claim and per ack, which
+// closes most of the throughput gap to job-queue libraries that don't
+// keep an audit log.
+type HistoryPolicy int
+
+const (
+	// HistoryFull writes a tickr_history row for every state
+	// transition: CREATED/RETRYING→HANDLING on claim, HANDLING→SUCCESS
+	// on ack, HANDLING→FAILED + FAILED→{RETRYING,DEAD} on fail, etc.
+	// This is the default and matches v1 behavior.
+	HistoryFull HistoryPolicy = iota
+
+	// HistoryOff skips all tickr_history writes on the hot path
+	// (Claim, Succeed, Fail, ReleaseShutdown). Requeue() still writes a
+	// history row since that's an explicit admin recovery action and
+	// off the hot path.
+	//
+	// Use when throughput is more important than per-message audit
+	// history. The Status field on tickr_messages still reflects the
+	// current state machine position — only the transition log goes
+	// dark.
+	HistoryOff
+)
+
 // Option configures a Store at construction time.
 type Option func(*Store)
+
+// WithHistoryPolicy selects whether the adapter writes per-transition
+// rows to tickr_history on the hot ack path. Defaults to HistoryFull.
+//
+// See HistoryPolicy for the trade-off.
+func WithHistoryPolicy(p HistoryPolicy) Option {
+	return func(s *Store) { s.historyPolicy = p }
+}
 
 // WithoutNotifier disables the automatic pg_notify emitted from Enqueue.
 // Use this when the underlying engine doesn't support LISTEN/NOTIFY (e.g.
@@ -79,6 +116,7 @@ type Store struct {
 	pool             *pgxpool.Pool
 	partitioned      bool
 	notifierDisabled bool
+	historyPolicy    HistoryPolicy
 }
 
 // New wraps an existing pgxpool.Pool. Callers own the pool lifecycle.
@@ -488,7 +526,7 @@ func (s *Store) Claim(ctx context.Context, p tickr.ClaimParams) ([]*tickr.Inboun
 	}
 
 	// Append a CREATED/RETRYING → HANDLING history row per claimed message.
-	if len(out) > 0 {
+	if len(out) > 0 && s.historyPolicy != HistoryOff {
 		if err := s.appendHistoryBatch(ctx, out, tickr.StatusHandling, "", p.WorkerID); err != nil {
 			return out, fmt.Errorf("tickr/postgres: claim history: %w", err)
 		}
@@ -520,17 +558,39 @@ func (s *Store) claimQuery(ctx context.Context, eventTypes any, batch int, worke
 
 // --- Succeed / Fail / Release / Extend -------------------------------------
 
+// succeedSQL combines the message UPDATE and the HANDLING→SUCCESS history
+// INSERT into a single round-trip. The history row is only written when
+// the UPDATE actually transitions a row (matching the prior Go-level
+// guard for a lost lease).
 const succeedSQL = `
+WITH upd AS (
+    UPDATE tickr_messages
+    SET    status        = 'SUCCESS',
+           claimed_until = NULL,
+           claimed_by    = NULL,
+           last_error    = NULL,
+           completed_at  = now(),
+           updated_at    = now()
+    WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2
+    RETURNING id, attempt
+)
+INSERT INTO tickr_history (message_id, seq, from_status, to_status, attempt, error, worker_id)
+SELECT u.id,
+       COALESCE((SELECT MAX(seq) FROM tickr_history WHERE message_id = $1), 0) + 1,
+       'HANDLING', 'SUCCESS', u.attempt, NULL, NULLIF($3, '')
+FROM   upd u`
+
+// succeedNoHistorySQL is the same UPDATE without the trailing history
+// INSERT — used under HistoryOff.
+const succeedNoHistorySQL = `
 UPDATE tickr_messages
-SET    status       = 'SUCCESS',
+SET    status        = 'SUCCESS',
        claimed_until = NULL,
        claimed_by    = NULL,
        last_error    = NULL,
        completed_at  = now(),
        updated_at    = now()
-WHERE  id = $1
-  AND  status = 'HANDLING'
-  AND  attempt = $2`
+WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2`
 
 // Succeed implements tickr.Storage.
 func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, workerID string) error {
@@ -538,18 +598,74 @@ func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, wo
 	if err != nil {
 		return fmt.Errorf("tickr/postgres: succeed: bad id: %w", err)
 	}
-	tag, err := s.pool.Exec(ctx, succeedSQL, mid, attempt)
-	if err != nil {
-		return fmt.Errorf("tickr/postgres: succeed: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
-		// Lease lost or stale attempt — silently ignore.
+	if s.historyPolicy == HistoryOff {
+		if _, err := s.pool.Exec(ctx, succeedNoHistorySQL, mid, attempt); err != nil {
+			return fmt.Errorf("tickr/postgres: succeed: %w", err)
+		}
 		return nil
 	}
-	return s.appendHistory(ctx, id, tickr.StatusHandling, tickr.StatusSuccess, attempt, "", workerID)
+	if _, err := s.pool.Exec(ctx, succeedSQL, mid, attempt, workerID); err != nil {
+		return fmt.Errorf("tickr/postgres: succeed: %w", err)
+	}
+	return nil
 }
 
+// failRetrySQL / failDeadSQL each fold the HANDLING→FAILED history INSERT,
+// the message status UPDATE, and the FAILED→{RETRYING,DEAD} history
+// INSERT into a single round-trip. The first INSERT is unconditional
+// (records the attempt regardless of lease loss); the second only fires
+// when the UPDATE transitioned a row.
 const failRetrySQL = `
+WITH ins_failed AS (
+    INSERT INTO tickr_history (message_id, seq, from_status, to_status, attempt, error, worker_id)
+    SELECT $1,
+           COALESCE((SELECT MAX(seq) FROM tickr_history WHERE message_id = $1), 0) + 1,
+           'HANDLING', 'FAILED', $2, NULLIF($3, ''), NULLIF($5, '')
+    RETURNING seq
+),
+upd AS (
+    UPDATE tickr_messages
+    SET    status        = 'RETRYING',
+           claimed_until = NULL,
+           claimed_by    = NULL,
+           last_error    = $3,
+           process_at    = $4,
+           updated_at    = now()
+    WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2
+    RETURNING id, attempt
+)
+INSERT INTO tickr_history (message_id, seq, from_status, to_status, attempt, error, worker_id)
+SELECT $1, (SELECT seq FROM ins_failed) + 1, 'FAILED', 'RETRYING',
+       u.attempt, NULLIF($3, ''), NULLIF($5, '')
+FROM   upd u`
+
+const failDeadSQL = `
+WITH ins_failed AS (
+    INSERT INTO tickr_history (message_id, seq, from_status, to_status, attempt, error, worker_id)
+    SELECT $1,
+           COALESCE((SELECT MAX(seq) FROM tickr_history WHERE message_id = $1), 0) + 1,
+           'HANDLING', 'FAILED', $2, NULLIF($3, ''), NULLIF($4, '')
+    RETURNING seq
+),
+upd AS (
+    UPDATE tickr_messages
+    SET    status        = 'DEAD',
+           claimed_until = NULL,
+           claimed_by    = NULL,
+           last_error    = $3,
+           completed_at  = now(),
+           updated_at    = now()
+    WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2
+    RETURNING id, attempt
+)
+INSERT INTO tickr_history (message_id, seq, from_status, to_status, attempt, error, worker_id)
+SELECT $1, (SELECT seq FROM ins_failed) + 1, 'FAILED', 'DEAD',
+       u.attempt, NULLIF($3, ''), NULLIF($4, '')
+FROM   upd u`
+
+// failRetryNoHistorySQL / failDeadNoHistorySQL drop the two history
+// INSERTs from the merged Fail CTE — used under HistoryOff.
+const failRetryNoHistorySQL = `
 UPDATE tickr_messages
 SET    status        = 'RETRYING',
        claimed_until = NULL,
@@ -557,11 +673,9 @@ SET    status        = 'RETRYING',
        last_error    = $3,
        process_at    = $4,
        updated_at    = now()
-WHERE  id = $1
-  AND  status = 'HANDLING'
-  AND  attempt = $2`
+WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2`
 
-const failDeadSQL = `
+const failDeadNoHistorySQL = `
 UPDATE tickr_messages
 SET    status        = 'DEAD',
        claimed_until = NULL,
@@ -569,9 +683,7 @@ SET    status        = 'DEAD',
        last_error    = $3,
        completed_at  = now(),
        updated_at    = now()
-WHERE  id = $1
-  AND  status = 'HANDLING'
-  AND  attempt = $2`
+WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2`
 
 // Fail implements tickr.Storage.
 func (s *Store) Fail(ctx context.Context, p tickr.FailParams) error {
@@ -579,31 +691,48 @@ func (s *Store) Fail(ctx context.Context, p tickr.FailParams) error {
 	if err != nil {
 		return fmt.Errorf("tickr/postgres: fail: bad id: %w", err)
 	}
-	var (
-		tag  pgconn.CommandTag
-		next tickr.Status
-	)
-	// History records the transient FAILED state, then the resolved state.
-	if err := s.appendHistory(ctx, p.MessageID, tickr.StatusHandling, tickr.StatusFailed, p.Attempt, p.Err, p.WorkerID); err != nil {
-		return err
-	}
-	if p.Dead {
-		tag, err = s.pool.Exec(ctx, failDeadSQL, mid, p.Attempt, p.Err)
-		next = tickr.StatusDead
+	if s.historyPolicy == HistoryOff {
+		if p.Dead {
+			_, err = s.pool.Exec(ctx, failDeadNoHistorySQL, mid, p.Attempt, p.Err)
+		} else {
+			_, err = s.pool.Exec(ctx, failRetryNoHistorySQL, mid, p.Attempt, p.Err, p.NextRetryAt)
+		}
+	} else if p.Dead {
+		_, err = s.pool.Exec(ctx, failDeadSQL, mid, p.Attempt, p.Err, p.WorkerID)
 	} else {
-		tag, err = s.pool.Exec(ctx, failRetrySQL, mid, p.Attempt, p.Err, p.NextRetryAt)
-		next = tickr.StatusRetrying
+		_, err = s.pool.Exec(ctx, failRetrySQL, mid, p.Attempt, p.Err, p.NextRetryAt, p.WorkerID)
 	}
 	if err != nil {
 		return fmt.Errorf("tickr/postgres: fail: %w", err)
 	}
-	if tag.RowsAffected() == 0 {
-		return nil // stale lease
-	}
-	return s.appendHistory(ctx, p.MessageID, tickr.StatusFailed, next, p.Attempt, p.Err, p.WorkerID)
+	return nil
 }
 
+// releaseShutdownSQL folds the message UPDATE and HANDLING→RETRYING
+// history INSERT into a single round-trip. The history row is only
+// written when the UPDATE transitions a row.
 const releaseShutdownSQL = `
+WITH upd AS (
+    UPDATE tickr_messages
+    SET    status        = 'RETRYING',
+           claimed_until = NULL,
+           claimed_by    = NULL,
+           attempt       = GREATEST(0, attempt - 1),
+           process_at    = now(),
+           last_error    = $3,
+           updated_at    = now()
+    WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2
+    RETURNING id, attempt
+)
+INSERT INTO tickr_history (message_id, seq, from_status, to_status, attempt, error, worker_id)
+SELECT u.id,
+       COALESCE((SELECT MAX(seq) FROM tickr_history WHERE message_id = $1), 0) + 1,
+       'HANDLING', 'RETRYING', u.attempt, NULLIF($3, ''), NULLIF($4, '')
+FROM   upd u`
+
+// releaseShutdownNoHistorySQL is the same UPDATE without the history
+// INSERT — used under HistoryOff.
+const releaseShutdownNoHistorySQL = `
 UPDATE tickr_messages
 SET    status        = 'RETRYING',
        claimed_until = NULL,
@@ -612,9 +741,7 @@ SET    status        = 'RETRYING',
        process_at    = now(),
        last_error    = $3,
        updated_at    = now()
-WHERE  id = $1
-  AND  status = 'HANDLING'
-  AND  attempt = $2`
+WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2`
 
 // ReleaseShutdown implements tickr.Storage.
 func (s *Store) ReleaseShutdown(ctx context.Context, id tickr.MessageID, attempt int, workerID, reason string) error {
@@ -622,14 +749,16 @@ func (s *Store) ReleaseShutdown(ctx context.Context, id tickr.MessageID, attempt
 	if err != nil {
 		return fmt.Errorf("tickr/postgres: release: bad id: %w", err)
 	}
-	tag, err := s.pool.Exec(ctx, releaseShutdownSQL, mid, attempt, reason)
-	if err != nil {
-		return fmt.Errorf("tickr/postgres: release: %w", err)
-	}
-	if tag.RowsAffected() == 0 {
+	if s.historyPolicy == HistoryOff {
+		if _, err := s.pool.Exec(ctx, releaseShutdownNoHistorySQL, mid, attempt, reason); err != nil {
+			return fmt.Errorf("tickr/postgres: release: %w", err)
+		}
 		return nil
 	}
-	return s.appendHistory(ctx, id, tickr.StatusHandling, tickr.StatusRetrying, attempt, reason, workerID)
+	if _, err := s.pool.Exec(ctx, releaseShutdownSQL, mid, attempt, reason, workerID); err != nil {
+		return fmt.Errorf("tickr/postgres: release: %w", err)
+	}
+	return nil
 }
 
 const extendSQL = `
