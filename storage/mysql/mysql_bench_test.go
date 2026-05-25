@@ -17,7 +17,8 @@ import (
 	mysqlstore "github.com/ndmt1at21/tickr/storage/mysql"
 )
 
-func BenchmarkMySQLDrain(b *testing.B) {
+func newBenchStore(b *testing.B) *mysqlstore.Store {
+	b.Helper()
 	ctx := context.Background()
 	container, err := tcmysql.Run(ctx,
 		"mysql:8.0",
@@ -60,6 +61,15 @@ func BenchmarkMySQLDrain(b *testing.B) {
 	if err := store.ApplyMigrations(ctx); err != nil {
 		b.Fatalf("apply migrations: %v", err)
 	}
+	return store
+}
 
+func BenchmarkMySQLDrain(b *testing.B) {
+	store := newBenchStore(b)
 	storagetest.RunDrainBenchmark(b, store, storagetest.BenchOptions{})
+}
+
+func BenchmarkMySQLEnqueue(b *testing.B) {
+	store := newBenchStore(b)
+	storagetest.RunEnqueueBenchmark(b, store, storagetest.BenchOptions{})
 }

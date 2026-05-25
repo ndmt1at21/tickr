@@ -164,3 +164,53 @@ func RunDrainBenchmark(b *testing.B, store tickr.Storage, opts BenchOptions) {
 
 	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "msgs/sec")
 }
+
+// RunEnqueueBenchmark measures EnqueueBatch insert throughput against store.
+//
+// It writes b.N messages in chunks of opts.EnqueueBatch and reports
+// msgs/sec. The benchmark timer covers only the EnqueueBatch calls.
+func RunEnqueueBenchmark(b *testing.B, store tickr.Storage, opts BenchOptions) {
+	b.Helper()
+	if b.N == 0 {
+		return
+	}
+	opts = opts.withDefaults()
+
+	eventType := fmt.Sprintf("bench.enqueue.%d", time.Now().UnixNano())
+
+	ctx, cancel := context.WithTimeout(context.Background(), opts.MaxWait)
+	defer cancel()
+
+	batch := make([]tickr.EnqueueParams, 0, opts.EnqueueBatch)
+
+	b.SetBytes(int64(len(opts.Payload)))
+	b.ResetTimer()
+	start := time.Now()
+
+	enqueued := 0
+	for enqueued < b.N {
+		n := opts.EnqueueBatch
+		if remaining := b.N - enqueued; remaining < n {
+			n = remaining
+		}
+		batch = batch[:0]
+		now := time.Now()
+		for i := 0; i < n; i++ {
+			batch = append(batch, tickr.EnqueueParams{
+				EventType:   eventType,
+				Payload:     opts.Payload,
+				MaxAttempts: 1,
+				ProcessAt:   now,
+			})
+		}
+		if _, err := store.EnqueueBatch(ctx, tickr.Tx{}, batch); err != nil {
+			b.Fatalf("enqueue: %v", err)
+		}
+		enqueued += n
+	}
+
+	elapsed := time.Since(start)
+	b.StopTimer()
+
+	b.ReportMetric(float64(b.N)/elapsed.Seconds(), "msgs/sec")
+}

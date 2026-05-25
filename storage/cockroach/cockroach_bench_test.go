@@ -16,7 +16,8 @@ import (
 	"github.com/ndmt1at21/tickr/storage/internal/storagetest"
 )
 
-func BenchmarkCockroachDrain(b *testing.B) {
+func newBenchStore(b *testing.B) *crstore.Store {
+	b.Helper()
 	ctx := context.Background()
 	req := testcontainers.ContainerRequest{
 		Image:        "cockroachdb/cockroach:latest-v23.2",
@@ -55,6 +56,15 @@ func BenchmarkCockroachDrain(b *testing.B) {
 	if err := store.ApplyMigrations(ctx); err != nil {
 		b.Fatalf("apply migrations: %v", err)
 	}
+	return store
+}
 
+func BenchmarkCockroachDrain(b *testing.B) {
+	store := newBenchStore(b)
 	storagetest.RunDrainBenchmark(b, store, storagetest.BenchOptions{})
+}
+
+func BenchmarkCockroachEnqueue(b *testing.B) {
+	store := newBenchStore(b)
+	storagetest.RunEnqueueBenchmark(b, store, storagetest.BenchOptions{})
 }
