@@ -442,10 +442,15 @@ These are not bugs. They are bounded scope.
   aggregates over the whole `tickr_messages` table. On multi-100M-row
   unpartitioned schemas, do not sample frequently. Tune
   `StatsPolicy.Interval` accordingly (default is "off").
-- **History is unbounded.** The retention policy purges
-  `tickr_messages` but not `tickr_history`. For long-lived deployments
-  consider a periodic `DELETE FROM tickr_history WHERE at < $cutoff`.
-  An auto-purge mode is a planned follow-up.
+- **History retention is automatic.** Whenever the janitor runs and the
+  storage adapter implements the optional `tickr.HistoryPurger`
+  extension, `tickr_history` is purged in the same pass as
+  `tickr_messages`. `RetentionPolicy.History == 0` picks a default of
+  `max(Success, Dead, 30d)` so history rows outlive their parent
+  message; set a positive duration to override or a negative value to
+  opt out entirely. The Postgres and MySQL adapters implement
+  `HistoryPurger`; the CockroachDB adapter forwards to the embedded
+  Postgres adapter.
 
 ### 11.3 Known follow-ups
 
@@ -455,7 +460,7 @@ Tracked here so contributors can pick them up:
       `DropPartitionsBefore`** that returns
       `ErrUnsupported("use CRDB-native partitioning")` instead of
       silently issuing Postgres DDL.
-- [ ] **MySQL: typed duplicate-key detection** via `errors.As` against
+- [x] **MySQL: typed duplicate-key detection** via `errors.As` against
       `*mysql.MySQLError{Number: 1062}` instead of substring match.
 - [ ] **Unit tests for non-trivial helpers** that have no integration
       coverage today: `parseUpperBound` (Postgres partition listing)
@@ -463,7 +468,7 @@ Tracked here so contributors can pick them up:
 - [ ] **`tickrctl drain --worker <id>`** that sends a signal (via a
       `tickr_admin` row or a separate channel) telling one specific
       worker to stop claiming.
-- [ ] **History retention.** A janitor pass for `tickr_history`
+- [x] **History retention.** A janitor pass for `tickr_history`
       governed by a separate `RetentionPolicy.History` field.
 - [ ] **Stats sampling pushdown.** Replace the full-scan
       `Stats()` with per-status counters maintained by triggers or

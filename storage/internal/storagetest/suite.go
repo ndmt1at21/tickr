@@ -30,6 +30,7 @@ func RunSuite(t *testing.T, store tickr.Storage, caps Capabilities) {
 	t.Run("requeue_from_dead", func(t *testing.T) { testRequeueFromDead(t, store) })
 	t.Run("reclaim_expired", func(t *testing.T) { testReclaimExpired(t, store) })
 	t.Run("purge_terminal", func(t *testing.T) { testPurgeTerminal(t, store) })
+	t.Run("purge_history", func(t *testing.T) { testPurgeHistory(t, store) })
 	t.Run("stats", func(t *testing.T) { testStats(t, store) })
 	t.Run("leader_lock_exclusion", func(t *testing.T) { testLeaderLock(t, store) })
 	if caps.SupportsNotifier {
@@ -210,6 +211,43 @@ func testPurgeTerminal(t *testing.T, store tickr.Storage) {
 	}
 	if n < 1 {
 		t.Errorf("expected at least 1 row purged, got %d", n)
+	}
+}
+
+// testPurgeHistory exercises the optional tickr.HistoryPurger extension.
+// Adapters that do not implement it are skipped. The test must also work
+// when the adapter is configured to skip history writes on the hot path
+// (Postgres `HistoryOff` policy) — in that case `before` will be empty
+// and the purge is a no-op, which we still assert succeeds.
+func testPurgeHistory(t *testing.T, store tickr.Storage) {
+	hp, ok := store.(tickr.HistoryPurger)
+	if !ok {
+		t.Skip("adapter does not implement tickr.HistoryPurger")
+	}
+	// Drive a message all the way through so history rows can exist:
+	// CREATED -> HANDLING -> SUCCESS.
+	m := mustEnqueue(t, store, tickr.EnqueueParams{EventType: "test.purge_history", Payload: []byte(`{}`)})
+	claimed := claimUntil(t, store, "test.purge_history", m.ID, "w-ph")
+	if err := store.Succeed(ctx(t), claimed.ID, claimed.Attempt, "w-ph"); err != nil {
+		t.Fatalf("succeed: %v", err)
+	}
+	before, err := store.History(ctx(t), m.ID)
+	if err != nil {
+		t.Fatalf("history before: %v", err)
+	}
+	n, err := hp.PurgeHistory(ctx(t), time.Now().Add(time.Hour), 1000)
+	if err != nil {
+		t.Fatalf("purge history: %v", err)
+	}
+	if len(before) > 0 && n < int64(len(before)) {
+		t.Errorf("expected at least %d history rows purged, got %d", len(before), n)
+	}
+	after, err := store.History(ctx(t), m.ID)
+	if err != nil {
+		t.Fatalf("history after: %v", err)
+	}
+	if len(after) != 0 {
+		t.Errorf("expected empty history after purge, got %d rows", len(after))
 	}
 }
 

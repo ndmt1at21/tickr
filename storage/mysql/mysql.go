@@ -20,10 +20,15 @@ import (
 	"strings"
 	"time"
 
+	mysqldrv "github.com/go-sql-driver/mysql"
 	"github.com/google/uuid"
 
 	"github.com/ndmt1at21/tickr"
 )
+
+// mysqlErrDupEntry is the MySQL/MariaDB server errno for a duplicate-key
+// collision (SQLSTATE 23000). The driver surfaces it as *mysql.MySQLError.
+const mysqlErrDupEntry = 1062
 
 // numClaimShards mirrors the Postgres adapter's split — see
 // storage/postgres/postgres.go for the design rationale.
@@ -228,13 +233,12 @@ func (s *Store) findByID(ctx context.Context, ex execer, id tickr.MessageID) (*t
 	return scanMessage(row)
 }
 
-// isDuplicateErr matches the MySQL "Duplicate entry" error (errno 1062).
+// isDuplicateErr matches the MySQL "Duplicate entry" error (errno 1062) via
+// typed unwrap. We rely on *mysql.MySQLError.Number so locale-translated
+// messages do not defeat the check.
 func isDuplicateErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return strings.Contains(err.Error(), "Error 1062") ||
-		strings.Contains(err.Error(), "Duplicate entry")
+	var me *mysqldrv.MySQLError
+	return errors.As(err, &me) && me.Number == mysqlErrDupEntry
 }
 
 // --- Claim ------------------------------------------------------------------
@@ -605,6 +609,24 @@ func (s *Store) PurgeTerminal(ctx context.Context, before time.Time, limit int) 
         LIMIT ?`, before, limit)
 	if err != nil {
 		return 0, fmt.Errorf("tickr/mysql: purge: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+// PurgeHistory implements tickr.HistoryPurger. Backed by the
+// tickr_history_at_idx index added in migration 0002.
+func (s *Store) PurgeHistory(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	res, err := s.db.ExecContext(ctx, `
+        DELETE FROM tickr_history
+        WHERE at < ?
+        ORDER BY at
+        LIMIT ?`, before, limit)
+	if err != nil {
+		return 0, fmt.Errorf("tickr/mysql: purge history: %w", err)
 	}
 	n, _ := res.RowsAffected()
 	return n, nil

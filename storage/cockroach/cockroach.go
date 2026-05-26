@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -48,6 +49,19 @@ func New(pool *pgxpool.Pool) *Store {
 
 // WrapTx adapts a pgx.Tx so it can be passed to Client.Enqueue.
 var WrapTx = pgstore.WrapTx
+
+// PurgeHistory forwards to the embedded Postgres adapter. The method is
+// declared explicitly because the embedded tickr.Storage interface field
+// only promotes methods that are part of tickr.Storage; tickr.HistoryPurger
+// is an optional extension that must be re-exposed by the outer type for
+// type assertions to succeed.
+func (s *Store) PurgeHistory(ctx context.Context, before time.Time, limit int) (int64, error) {
+	hp, ok := s.Storage.(tickr.HistoryPurger)
+	if !ok {
+		return 0, nil
+	}
+	return hp.PurgeHistory(ctx, before, limit)
+}
 
 // ApplyMigrations runs the standard Postgres migrations, then bootstraps the
 // tickr_locks table used by the row-lock leader election.

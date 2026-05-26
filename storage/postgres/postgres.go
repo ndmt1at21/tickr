@@ -994,6 +994,28 @@ func (s *Store) PurgeTerminal(ctx context.Context, before time.Time, limit int) 
 	return tag.RowsAffected(), nil
 }
 
+const purgeHistorySQL = `
+DELETE FROM tickr_history
+WHERE (message_id, seq) IN (
+    SELECT message_id, seq FROM tickr_history
+    WHERE  at < $1
+    ORDER BY at
+    LIMIT  $2
+)`
+
+// PurgeHistory implements tickr.HistoryPurger. Backed by the
+// tickr_history_at_idx index added in migration 0002.
+func (s *Store) PurgeHistory(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		limit = 5000
+	}
+	tag, err := s.pool.Exec(ctx, purgeHistorySQL, before, limit)
+	if err != nil {
+		return 0, fmt.Errorf("tickr/postgres: purge history: %w", err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // --- Stats ------------------------------------------------------------------
 
 const statsSQL = `

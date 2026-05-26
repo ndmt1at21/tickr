@@ -11,8 +11,15 @@ import (
 
 // RetentionPolicy controls how long terminal-state rows are kept.
 type RetentionPolicy struct {
-	Success    time.Duration // 0 => 24h
-	Dead       time.Duration // 0 => 30d; set negative for "never purge DEAD"
+	Success time.Duration // 0 => 24h
+	Dead    time.Duration // 0 => 30d; set negative for "never purge DEAD"
+	// History is the maximum age of tickr_history rows. 0 => default
+	// (max of Success, Dead, 30d) — once the janitor is running there
+	// is no reason to let history grow unbounded. Set negative to opt
+	// out explicitly. Requires the storage adapter to implement
+	// tickr.HistoryPurger; adapters that do not implement it silently
+	// skip this phase.
+	History    time.Duration
 	PurgeBatch int           // 0 => 5000
 	PurgeEvery time.Duration // 0 => 1m
 }
@@ -254,22 +261,68 @@ func (w *Worker) tryPurge(ctx context.Context) {
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
-	if deadAge < 0 {
+	if deadAge >= 0 {
+		if deadAge == 0 {
+			deadAge = 30 * 24 * time.Hour
+		}
+		deadCutoff := time.Now().Add(-deadAge)
+		for {
+			n, err := w.cfg.Storage.PurgeTerminal(ctx, deadCutoff, batch)
+			if err != nil {
+				w.cfg.Logger.Error(ctx, "tickr: purge DEAD failed", err)
+				fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindJanitor, Err: err})
+				break
+			}
+			if n < int64(batch) {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+		}
+	}
+
+	w.purgeHistory(ctx, batch)
+}
+
+// purgeHistory deletes tickr_history rows older than Retention.History.
+// History == 0 picks the default (max of effective Success, Dead, 30d).
+// History < 0 opts out. Storage adapters that do not implement
+// tickr.HistoryPurger skip this phase silently.
+func (w *Worker) purgeHistory(ctx context.Context, batch int) {
+	historyAge := w.cfg.Retention.History
+	if historyAge < 0 {
 		return
 	}
-	if deadAge == 0 {
-		deadAge = 30 * 24 * time.Hour
+	hp, ok := w.cfg.Storage.(HistoryPurger)
+	if !ok {
+		return
 	}
-	deadCutoff := time.Now().Add(-deadAge)
+	if historyAge == 0 {
+		successAge := w.cfg.Retention.Success
+		if successAge <= 0 {
+			successAge = 24 * time.Hour
+		}
+		deadAge := w.cfg.Retention.Dead
+		if deadAge < 0 {
+			deadAge = 0 // ignore "never purge DEAD" for sizing history window
+		} else if deadAge == 0 {
+			deadAge = 30 * 24 * time.Hour
+		}
+		historyAge = max(successAge, deadAge, 30*24*time.Hour)
+	}
+	cutoff := time.Now().Add(-historyAge)
 	for {
-		n, err := w.cfg.Storage.PurgeTerminal(ctx, deadCutoff, batch)
+		n, err := hp.PurgeHistory(ctx, cutoff, batch)
 		if err != nil {
-			w.cfg.Logger.Error(ctx, "tickr: purge DEAD failed", err)
+			w.cfg.Logger.Error(ctx, "tickr: purge history failed", err)
 			fireAlert(w.cfg.Alerter, w.cfg.Logger, ctx, ErrorEvent{Kind: ErrorKindJanitor, Err: err})
-			break
+			return
 		}
 		if n < int64(batch) {
-			break
+			return
 		}
 		select {
 		case <-ctx.Done():

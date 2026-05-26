@@ -311,7 +311,8 @@ Highlights:
   default).
 - MySQL and CockroachDB adapters do not implement `LISTEN/NOTIFY` and
   fall back to pure polling (~100 ms typical wake-up).
-- `tickr_history` retention is currently manual.
+- `tickr_history` retention is opt-in via `RetentionPolicy.History`
+  (default off for backwards compatibility).
 
 Section 11.3 lists planned follow-ups; contributions welcome.
 

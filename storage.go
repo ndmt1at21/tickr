@@ -81,3 +81,12 @@ type Storage interface {
 	ApplyMigrations(ctx context.Context) error
 	TryLeaderLock(ctx context.Context, key string) (bool, func(), error)
 }
+
+// HistoryPurger is an optional Storage extension that deletes old
+// tickr_history rows. Adapters that implement it are picked up by the
+// Worker's janitor when RetentionPolicy.History > 0. Adapters that do not
+// implement it silently skip history purge — history grows unbounded
+// until an operator runs DELETE manually.
+type HistoryPurger interface {
+	PurgeHistory(ctx context.Context, before time.Time, limit int) (int64, error)
+}
