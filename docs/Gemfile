@@ -1,5 +1,12 @@
 source "https://rubygems.org"
 
-gem "github-pages", group: :jekyll_plugins
+gem "jekyll", "~> 4.3"
 gem "jekyll-remote-theme"
 gem "jekyll-seo-tag"
+gem "just-the-docs"
+
+# Ruby 3.0+ removed these from stdlib but Jekyll's deps still expect them.
+gem "webrick"
+gem "csv"
+gem "logger"
+gem "base64"
