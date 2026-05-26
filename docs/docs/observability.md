@@ -1,20 +1,12 @@
 ---
+id: observability
 title: Observability
-nav_order: 7
-permalink: /observability/
+sidebar_position: 7
 ---
 
 # Observability
-{: .no_toc }
 
 tickr ships first-class hooks for Prometheus, OpenTelemetry, and Grafana. Each integration lives in its own subpackage so its dependencies stay out of the core `go.mod`.
-
-<details open markdown="block">
-  <summary>Table of contents</summary>
-  {: .text-delta }
-- TOC
-{:toc}
-</details>
 
 ## Prometheus
 

@@ -1,20 +1,12 @@
 ---
+id: handlers
 title: Built-in handlers
-nav_order: 5
-permalink: /handlers/
+sidebar_position: 5
 ---
 
 # Built-in transport handlers
-{: .no_toc }
 
 Two subpackages skip the boilerplate when the handler's only job is to forward the message to a downstream service. Each lives in its own Go module so its transport-specific dependencies stay out of the core `go.mod`.
-
-<details open markdown="block">
-  <summary>Table of contents</summary>
-  {: .text-delta }
-- TOC
-{:toc}
-</details>
 
 ## HTTP webhook — `handlers/http`
 

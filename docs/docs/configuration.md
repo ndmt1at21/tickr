@@ -1,20 +1,12 @@
 ---
+id: configuration
 title: Configuration
-nav_order: 6
-permalink: /configuration/
+sidebar_position: 6
 ---
 
 # Configuration reference
-{: .no_toc }
 
 Every knob, with its default and what it controls.
-
-<details open markdown="block">
-  <summary>Table of contents</summary>
-  {: .text-delta }
-- TOC
-{:toc}
-</details>
 
 ## ClientConfig
 
@@ -92,8 +84,9 @@ Controls how long terminal-state rows and history rows are kept.
 | `PurgeBatch` | `int` | `5000` | Rows deleted per batch (tunes lock duration) |
 | `PurgeEvery` | `time.Duration` | `1m` | How often the janitor wakes |
 
-{: .note }
-> `History` purging requires the storage adapter to implement `tickr.HistoryPurger`. Adapters that don't implement it skip this phase silently.
+:::note
+`History` purging requires the storage adapter to implement `tickr.HistoryPurger`. Adapters that don't implement it skip this phase silently.
+:::
 
 ## HandlerOption
 

@@ -1,20 +1,12 @@
 ---
+id: consumer
 title: Consumer
-nav_order: 4
-permalink: /consumer/
+sidebar_position: 4
 ---
 
 # Consumer (Worker + Registry)
-{: .no_toc }
 
 The worker side runs a claim loop, dispatches handlers, auto-extends leases, and (when leader) runs the reclaimer / janitor / stats loops.
-
-<details open markdown="block">
-  <summary>Table of contents</summary>
-  {: .text-delta }
-- TOC
-{:toc}
-</details>
 
 ## Registry
 
@@ -118,7 +110,7 @@ if err := w.Start(ctx); err != nil { // blocks
 
 `Worker.Stop(ctx)` cancels the worker's context; the blocking drain happens inside `Start` bounded by `ShutdownGrace`.
 
-See [Configuration → WorkerConfig]({{ '/configuration/#workerconfig' | relative_url }}) for the full knob reference.
+See [Configuration → WorkerConfig](./configuration.md#workerconfig) for the full knob reference.
 
 ## Handler return semantics
 
@@ -129,7 +121,7 @@ type Handler func(ctx context.Context, msg *InboundMessage) error
 | Return | Effect |
 |---|---|
 | `nil` | `SUCCESS` |
-| Generic `error` (attempt < max) | `FAILED → RETRYING` with backoff |
+| Generic `error` (attempt &lt; max) | `FAILED → RETRYING` with backoff |
 | Generic `error` (attempt == max) | `FAILED → DEAD` |
 | `tickr.DeadLetter(err)` | Straight to `DEAD`, no retry burn |
 | `tickr.RetryAfter(d, err)` | Overrides `RetryPolicy` with explicit delay |

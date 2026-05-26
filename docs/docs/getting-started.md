@@ -1,20 +1,12 @@
 ---
+id: getting-started
 title: Getting started
-nav_order: 2
-permalink: /getting-started/
+sidebar_position: 2
 ---
 
 # Getting started
-{: .no_toc }
 
 End-to-end: producer enqueues, worker dispatches, PostgreSQL backs the outbox. ~10 minutes.
-
-<details open markdown="block">
-  <summary>Table of contents</summary>
-  {: .text-delta }
-- TOC
-{:toc}
-</details>
 
 ## 1. Install
 
@@ -68,10 +60,11 @@ if err != nil && !tickr.IsDuplicate(err) {
 return tx.Commit(ctx)
 ```
 
-{: .tip }
-> Re-running the same idempotency key after a network retry returns `*ErrDuplicate` carrying the existing `MessageID` — treat it as success.
+:::tip
+Re-running the same idempotency key after a network retry returns `*ErrDuplicate` carrying the existing `MessageID` — treat it as success.
+:::
 
-See [Producer]({{ '/producer/' | relative_url }}) for `EnqueueBatch`, delayed messages, and trace propagation.
+See [Producer](./producer.md) for `EnqueueBatch`, delayed messages, and trace propagation.
 
 ## 4. Consumer side
 
@@ -107,7 +100,7 @@ w, _ := tickr.NewWorker(tickr.WorkerConfig{
 _ = w.Start(ctx)
 ```
 
-A malformed payload is dead-lettered immediately (it won't decode on retry either) — see [Consumer]({{ '/consumer/' | relative_url }}).
+A malformed payload is dead-lettered immediately (it won't decode on retry either) — see [Consumer](./consumer.md).
 
 ## 5. Graceful shutdown
 
@@ -145,7 +138,7 @@ Observe:
 
 ## Next
 
-- [Producer]({{ '/producer/' | relative_url }}) — Client API, batch enqueue, delayed messages
-- [Consumer]({{ '/consumer/' | relative_url }}) — Registry, batch handlers, retry / dead-letter / skip
-- [Configuration]({{ '/configuration/' | relative_url }}) — every knob, with defaults
-- [Observability]({{ '/observability/' | relative_url }}) — Prometheus, OpenTelemetry, Grafana
+- [Producer](./producer.md) — Client API, batch enqueue, delayed messages
+- [Consumer](./consumer.md) — Registry, batch handlers, retry / dead-letter / skip
+- [Configuration](./configuration.md) — every knob, with defaults
+- [Observability](./observability.md) — Prometheus, OpenTelemetry, Grafana

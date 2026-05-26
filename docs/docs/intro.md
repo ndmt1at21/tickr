@@ -1,7 +1,8 @@
 ---
-title: Home
-layout: home
-nav_order: 1
+id: intro
+title: tickr
+sidebar_position: 1
+slug: /
 ---
 
 # tickr
@@ -30,12 +31,12 @@ Target throughput: **1M messages/minute** across a horizontally scaled fleet.
 
 | If you want to… | Read |
 |---|---|
-| Stand up a producer + worker in 10 minutes | [Getting started]({{ '/getting-started/' | relative_url }}) |
-| Understand `Client.Enqueue` and the outbox guarantee | [Producer]({{ '/producer/' | relative_url }}) |
-| Register handlers and tune the worker pool | [Consumer]({{ '/consumer/' | relative_url }}) |
-| Forward messages to HTTP / gRPC without writing a handler | [Built-in handlers]({{ '/handlers/' | relative_url }}) |
-| Look up every knob | [Configuration]({{ '/configuration/' | relative_url }}) |
-| Wire Prometheus, OpenTelemetry, Grafana | [Observability]({{ '/observability/' | relative_url }}) |
+| Stand up a producer + worker in 10 minutes | [Getting started](./getting-started.md) |
+| Understand `Client.Enqueue` and the outbox guarantee | [Producer](./producer.md) |
+| Register handlers and tune the worker pool | [Consumer](./consumer.md) |
+| Forward messages to HTTP / gRPC without writing a handler | [Built-in handlers](./handlers.md) |
+| Look up every knob | [Configuration](./configuration.md) |
+| Wire Prometheus, OpenTelemetry, Grafana | [Observability](./observability.md) |
 
 ## At a glance
 
@@ -67,7 +68,7 @@ _ = tickr.On(reg, "order.created",
 
 ## Links
 
-- **Source code**: <https://github.com/ndmt1at21/tickr>
-- **Go reference**: <https://pkg.go.dev/github.com/ndmt1at21/tickr>
+- **Source code**: [github.com/ndmt1at21/tickr](https://github.com/ndmt1at21/tickr)
+- **Go reference**: [pkg.go.dev/github.com/ndmt1at21/tickr](https://pkg.go.dev/github.com/ndmt1at21/tickr)
 - **Architecture deep-dive**: [ARCHITECTURE.md](https://github.com/ndmt1at21/tickr/blob/main/ARCHITECTURE.md)
 - **Benchmarks vs River / Gue / Watermill / Asynq**: [BENCHMARKS.md](https://github.com/ndmt1at21/tickr/blob/main/BENCHMARKS.md)

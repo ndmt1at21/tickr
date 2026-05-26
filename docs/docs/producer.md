@@ -1,20 +1,12 @@
 ---
+id: producer
 title: Producer
-nav_order: 3
-permalink: /producer/
+sidebar_position: 3
 ---
 
 # Producer (Client)
-{: .no_toc }
 
 `tickr.Client` writes outbox rows through the configured `Storage` adapter, optionally participating in the caller's transaction.
-
-<details open markdown="block">
-  <summary>Table of contents</summary>
-  {: .text-delta }
-- TOC
-{:toc}
-</details>
 
 ## NewClient
 
@@ -31,8 +23,8 @@ client, err := tickr.NewClient(tickr.ClientConfig{
 | `Storage` | `tickr.Storage` | — (required) | Adapter — typically `pgstore.New(pool)` |
 | `DefaultMaxAttempts` | `int` | `10` | Used when a `Message.MaxAttempts` is zero |
 | `Logger` | `tickr.Logger` | nop | Structured logger |
-| `Metrics` | `tickr.Metrics` | nop | Metrics hook — see [Observability]({{ '/observability/' | relative_url }}) |
-| `Tracer` | `tickr.Tracer` | nop | Tracer hook — see [Observability]({{ '/observability/' | relative_url }}) |
+| `Metrics` | `tickr.Metrics` | nop | Metrics hook — see [Observability](./observability.md) |
+| `Tracer` | `tickr.Tracer` | nop | Tracer hook — see [Observability](./observability.md) |
 
 ## Enqueue
 
@@ -105,7 +97,7 @@ The claim query filters by `process_at <= now()` — delayed rows simply skip th
 
 When `ClientConfig.Tracer` is set (typically `tracing/otel`), the W3C `traceparent` and `tracestate` headers are injected into `Message.Headers` at enqueue time. The consumer side extracts them at dispatch, so **a single trace spans producer → outbox → consumer across processes**, even if the consumer runs hours later.
 
-See [Observability → OpenTelemetry]({{ '/observability/#opentelemetry' | relative_url }}).
+See [Observability → OpenTelemetry](./observability.md#opentelemetry).
 
 ## Encode helper
 
