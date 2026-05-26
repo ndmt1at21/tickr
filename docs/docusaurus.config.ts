@@ -6,7 +6,7 @@ const config: Config = {
   title: "tickr",
   tagline:
     "Reliable async messaging for Go microservices — transactional outbox without an external broker.",
-  favicon: "img/logo.svg",
+  favicon: "img/logo.png",
 
   url: "https://ndmt1at21.github.io",
   baseUrl: "/tickr/",
@@ -52,7 +52,7 @@ const config: Config = {
       title: "tickr",
       logo: {
         alt: "tickr",
-        src: "img/logo.svg",
+        src: "img/logo.png",
       },
       items: [
         {

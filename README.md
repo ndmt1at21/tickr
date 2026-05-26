@@ -1,3 +1,5 @@
+![alt text](docs/logo.png)
+
 # tickr
 
 [![CI](https://github.com/ndmt1at21/tickr/actions/workflows/ci.yml/badge.svg)](https://github.com/ndmt1at21/tickr/actions/workflows/ci.yml)
