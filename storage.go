@@ -90,3 +90,20 @@ type Storage interface {
 type HistoryPurger interface {
 	PurgeHistory(ctx context.Context, before time.Time, limit int) (int64, error)
 }
+
+// BatchSucceedParam describes a single successful message completion
+// for use with BatchAcker.
+type BatchSucceedParam struct {
+	MessageID MessageID
+	Attempt   int
+	WorkerID  string
+}
+
+// BatchAcker is an optional Storage extension that commits multiple successful
+// messages in one round-trip (one explicit transaction → one WAL fsync,
+// regardless of batch size). When Storage implements this interface, the
+// engine uses it on the success path to amortise WAL fsyncs across the batch.
+// Adapters that do not implement it fall back to Storage.Succeed per message.
+type BatchAcker interface {
+	BatchSucceed(ctx context.Context, params []BatchSucceedParam) error
+}

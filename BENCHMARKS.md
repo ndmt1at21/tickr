@@ -80,24 +80,40 @@ runs after first-iteration container/OS-cache warmup.
 
 ### Enqueue (msgs/sec, higher is better)
 
+> Numbers below the rule are from the **2026-05-26 re-run** on Intel
+> i5-8300H after the unnest `EnqueueBatch` rewrite. Pre-rewrite rows
+> are from the i7-1255U reference host.
+
 | Library | msgs/sec | Notes |
 |---|---:|---|
-| **Watermill SQL** | **106,802** | Single multi-row INSERT per batch; thinnest table |
-| Gue | 95,045 | Simple table (no history/metadata cols), pgx batch |
-| River | 52,854 | `InsertMany`, rich job-state columns |
-| tickr | 39,133 | `EnqueueBatch` writes `tickr_messages` + pg_notify per row |
+| **Watermill SQL** | **106,802** | Single multi-row INSERT per batch; thinnest table (i7 ref) |
+| Gue | 95,045 | Simple table (no history/metadata cols), pgx batch (i7 ref) |
+| River | 52,854 | `InsertMany`, rich job-state columns (i7 ref) |
+| tickr | 39,133 | Pre-rewrite: N individual INSERTs via `pgx.Batch` (i7 ref) |
 | Asynq | 4,370 | One-by-one (no batch API), Redis round-trip per msg |
+|---|---|---|
+| **tickr (unnest)** | **42,725** | Single `INSERT … SELECT unnest($1[]…)` — 1 round-trip (i5, 2026-05-26) |
+| River | 29,649 | Same host for apples-to-apples (i5, 2026-05-26) |
 
 ### Drain (msgs/sec, higher is better)
+
+> Numbers below the rule are from the **2026-05-26 re-run** on Intel
+> i5-8300H after shipping Tier 3 (batched ack). The pre-Tier-3 rows are
+> preserved above the rule for reference (they were measured on i7-1255U;
+> direct cross-machine comparison is approximate).
 
 | Library | msgs/sec | Notes |
 |---|---:|---|
 | **Watermill SQL** | **40,010** | Pub/sub model — advances consumer offset, no per-msg UPDATE |
-| River | 5,991 | Notify-based dispatch + pgx-native ack |
-| tickr (HistoryOff) | 4,809 | `WithHistoryPolicy(HistoryOff)` — skips per-transition audit writes |
-| tickr (default) | 4,259 | UPDATE + history INSERT folded into one CTE ([postgres.go:537](storage/postgres/postgres.go#L537)) |
+| River | 5,991 | Notify-based dispatch + pgx-native ack (i7 reference) |
+| tickr (HistoryOff) | 4,809 | Pre-Tier-3 (i7 reference) |
+| tickr (default) | 4,259 | Pre-Tier-3 (i7 reference) |
 | Asynq | 2,655 | Redis-backed, per-msg LPOP/ZADD round-trip |
 | Gue | 1,835 | Per-msg DELETE on success + pgx-native ack |
+|---|---|---|
+| **tickr (HistoryOff + BatchedAck)** | **5,943** | `BatchSucceed` — N acks in 1 tx → 1 WAL fsync (i5, 2026-05-26) |
+| River | 5,662 | Same bench, same host for apples-to-apples (i5, 2026-05-26) |
+| tickr (default + BatchedAck) | 3,684 | CTE still writes 2 rows/msg; WAL bytes, not fsyncs, are now the cap |
 
 ### How to read these
 
@@ -106,104 +122,30 @@ runs after first-iteration container/OS-cache warmup.
   state machine, so an ack is one row-update bumping the offset, not
   N row-updates marking jobs SUCCESS. Different guarantee, different
   workload.
-- **tickr trails River on drain (~67%)** because each ack still writes
-  two rows: the `tickr_messages` UPDATE *and* a row in `tickr_history`
-  for the HANDLING→SUCCESS transition. The transitions are folded into
-  a single CTE round-trip ([postgres.go:521-657](storage/postgres/postgres.go#L521-L657)),
-  but the **write volume** is still ~2× River's. The next lever to
-  close this gap is a `HistoryPolicy` knob (`Off` / `AsyncBuffered`)
-  for users who don't need a per-message audit log — see [tier 2 in the
-  improvement plan](#tier-2--optional-history-for-high-throughput).
+- **tickr (HistoryOff + BatchedAck) now matches River** on the same
+  host. The batched-ack path (`BatchAcker` interface + `ackFlusher`
+  goroutine) cuts WAL fsyncs from N per claim batch to 1, which was
+  the root bottleneck identified in the Tier 3 analysis.
+- **tickr default still trails** because each ack writes two rows (the
+  UPDATE *and* a `tickr_history` INSERT via CTE). The fsync count is
+  now 1 per batch, but WAL *byte* volume is unchanged — that's the
+  remaining gap. Users who need the audit log and top throughput should
+  combine `BatchedAck` with `AsyncBuffered` history (not yet shipped).
 - **Gue's drain throughput trails its enqueue** because each success
   does a row-DELETE under `FOR UPDATE SKIP LOCKED`; insert is cheap,
   but the consumer is bound by per-row write amplification.
 - **Asynq's enqueue gap** is the no-batch API — every `Enqueue` is one
   Redis round-trip. With pipelining, that number would multiply.
+- **tickr now beats River on enqueue** on the same host after switching
+  `EnqueueBatch` from N individual INSERTs via `pgx.Batch` to a single
+  `INSERT … SELECT unnest($1::uuid[], …)`. The remaining gap to
+  Gue/Watermill is tickr's wider table (headers, idempotency_key, shard,
+  max_attempts columns) — inherent to the feature set, not the query path.
 - All numbers are from a **single-host, single-container** setup. On a
   real Postgres cluster with PgBouncer, tuned autovacuum, and
   horizontally-scaled workers, network RTT is meaningfully nonzero —
-  so the round-trip-count optimizations (like the CTE merge below)
-  matter more there than they do on this loopback bench.
-
-## Optimization log
-
-### 2026-05-25 — Fold ack UPDATE + history INSERT into one CTE
-
-Per-message ack was 2–3 separate `pool.Exec` calls in the Postgres
-adapter: an UPDATE on `tickr_messages` plus 1–2 INSERTs into
-`tickr_history`. Each was a separate round-trip on the pool. Folded
-into single CTE queries in [storage/postgres/postgres.go:537-664](storage/postgres/postgres.go#L537-L664):
-
-- `Succeed`: 2 round-trips → **1**
-- `ReleaseShutdown`: 2 round-trips → **1**
-- `Fail`: 3 round-trips → **1** (records both the transient FAILED
-  state and the resolved RETRYING/DEAD state in one statement)
-
-**Observed gain on this bench:** ~4% on drain (3,825 → 3,978
-msgs/sec). Modest, because Docker-loopback round-trips are ~10µs each
-— the ack cost is dominated by WAL write amplification, not network.
-On a real PG cluster (1–2 ms RTT) the same change would be a
-multi-x speedup on the ack path.
-
-**Verified:** all postgres conformance tests pass
-(`go test -tags integration ./storage/postgres/...`), including
-`succeed`, `fail_retry_then_dead`, and `notifier`.
-
-### 2026-05-25 — `HistoryOff` policy for opt-out audit log
-
-Added `pgstore.WithHistoryPolicy(pgstore.HistoryOff)`
-([postgres.go:49-90](storage/postgres/postgres.go#L49-L90)). Under
-`HistoryOff`, the adapter skips every `tickr_history` INSERT on
-the hot path: the claim-time batch insert, the per-message
-HANDLING→SUCCESS row, and the HANDLING→FAILED→{RETRYING,DEAD}
-pair on Fail. UPDATE-only variants replace the CTE queries
-when the policy is set. Admin recovery (`Requeue`) still records
-DEAD→CREATED so manual interventions remain auditable.
-
-**Observed gain on this bench:** drain median 4,259 → 4,809
-msgs/sec (+13%) at `-benchtime=20000x`.
-
-**Why not larger?** The per-ack bottleneck on this bench is
-**WAL fsync per `Succeed` Exec**, not row volume — see Tier 3
-below.
-
-**Verified:** new `TestPostgresHistoryOff` runs the full
-conformance suite under `HistoryOff` and asserts that no rows
-with `from_status='HANDLING'` ever land in `tickr_history`
-([postgres_integration_test.go:54-105](storage/postgres/postgres_integration_test.go#L54-L105)).
-
-## What's next
-
-### Tier 1 — already shipped
-
-- ☑ Fold ack UPDATE + history INSERT into single CTE.
-
-### Tier 2 — optional history (shipped)
-
-- ☑ `WithHistoryPolicy(HistoryOff)` skips all hot-path
-  `tickr_history` writes ([postgres.go:49](storage/postgres/postgres.go#L49)).
-  Admin recovery (Requeue) still writes history rows by design.
-
-**Observed gain:** median drain 4,259 → 4,809 msgs/sec (+13%).
-
-**Smaller than the "double the writes" math suggests** — turns out
-the `tickr_history` INSERT was not the actual bottleneck on this
-bench. Each `Succeed` is its own implicit transaction, so the
-hot path is dominated by **WAL fsync per ack**, not by row volume.
-Removing the history row cuts WAL bytes but not fsync count. On a
-real cluster (where network RTT matters more than fsync latency)
-the gain will be larger, but the next big lever is batching the
-ack itself.
-
-### Tier 3 — batched ack via `pgx.SendBatch`
-
-Today each completed message acks independently in its own
-transaction ([engine.go:416](engine.go#L416)) → 1 fsync per ack.
-Accumulating completions per claim-cycle and flushing them in one
-`pgx.SendBatch` (or one `BEGIN; UPDATE...; UPDATE...; COMMIT`) would
-amortize fsync across the batch. This is the **highest-leverage
-remaining optimization** — projected to push drain into River
-territory (~6k+ msgs/sec) on this bench, more on a real cluster.
+  so the round-trip-count optimizations matter more there than on this
+  loopback bench.
 
 ## Caveats
 

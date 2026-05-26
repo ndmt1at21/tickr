@@ -63,6 +63,23 @@ func (s *Store) PurgeHistory(ctx context.Context, before time.Time, limit int) (
 	return hp.PurgeHistory(ctx, before, limit)
 }
 
+// BatchSucceed forwards to the embedded Postgres adapter. Declared explicitly
+// for the same reason as PurgeHistory: the embedded tickr.Storage interface
+// field only promotes methods in the core interface; tickr.BatchAcker is an
+// optional extension that must be re-exposed here so type assertions by the
+// engine succeed.
+//
+// CockroachDB replaces WAL fsync with Raft consensus (one proposal per
+// transaction), so batching N acks here reduces N Raft proposals to 1 —
+// the gain is proportionally larger than on a single-node Postgres.
+func (s *Store) BatchSucceed(ctx context.Context, params []tickr.BatchSucceedParam) error {
+	ba, ok := s.Storage.(tickr.BatchAcker)
+	if !ok {
+		return nil
+	}
+	return ba.BatchSucceed(ctx, params)
+}
+
 // ApplyMigrations runs the standard Postgres migrations, then bootstraps the
 // tickr_locks table used by the row-lock leader election.
 func (s *Store) ApplyMigrations(ctx context.Context) error {

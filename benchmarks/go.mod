@@ -6,7 +6,6 @@ go 1.25.7
 replace github.com/ndmt1at21/tickr => ../
 
 require (
-
 	// Watermill SQL Pub/Sub
 	github.com/ThreeDotsLabs/watermill v1.4.4
 	github.com/ThreeDotsLabs/watermill-sql/v3 v3.1.0

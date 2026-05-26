@@ -198,9 +198,15 @@ func newID() uuid.UUID {
 	return id
 }
 
+// emptyHeadersJSON is a pre-allocated sentinel returned by encodeHeaders when
+// the map is nil or empty. Avoids one heap allocation per message on the hot
+// enqueue path (500 allocations saved per EnqueueBatch call at default chunk
+// size when callers don't set headers).
+var emptyHeadersJSON = []byte("{}")
+
 func encodeHeaders(h map[string]string) []byte {
 	if len(h) == 0 {
-		return []byte("{}")
+		return emptyHeadersJSON
 	}
 	b, _ := json.Marshal(h)
 	return b
@@ -218,9 +224,13 @@ func decodeHeaders(b []byte) map[string]string {
 	return m
 }
 
+// scanner is satisfied by both pgx.Row (single-row query) and pgx.Rows
+// (multi-row query), allowing scanMessage to be reused on both call sites.
+type scanner interface{ Scan(dest ...any) error }
+
 // scanMessage reads a tickr_messages row in the canonical column order used
 // across all queries returning messages.
-func scanMessage(row pgx.Row) (*tickr.InboundMessage, error) {
+func scanMessage(row scanner) (*tickr.InboundMessage, error) {
 	var (
 		id          uuid.UUID
 		eventType   string
@@ -381,88 +391,163 @@ func (s *Store) findByIdempotency(ctx context.Context, q querier, eventType, key
 	return msg, nil
 }
 
-// EnqueueBatch implements tickr.Storage. Uses pgx.Batch to pipeline
-// inserts in one round-trip.
+// batchInsertSQL inserts a whole batch in a single round-trip by passing
+// typed arrays and using unnest() to expand them into rows. One statement
+// replaces N individual INSERTs, cutting parse/plan overhead and WAL record
+// count proportionally. RETURNING yields only actually-inserted rows; rows
+// skipped by ON CONFLICT DO NOTHING are absent from the result set.
+const batchInsertSQL = `
+INSERT INTO tickr_messages
+    (id, event_type, payload, headers, idempotency_key, status,
+     attempt, max_attempts, process_at, shard, created_at, updated_at)
+SELECT unnest($1::uuid[]),
+       unnest($2::text[]),
+       unnest($3::bytea[]),
+       unnest($4::jsonb[]),
+       nullif(unnest($5::text[]), ''),
+       'CREATED', 0,
+       unnest($6::int[]),
+       unnest($7::timestamptz[]),
+       unnest($8::smallint[]),
+       now(), now()
+ON CONFLICT (event_type, idempotency_key) WHERE idempotency_key IS NOT NULL
+    DO NOTHING
+RETURNING ` + messageReturnCols
+
+// batchInsertPartitionedSQL is the partitioned-schema variant of batchInsertSQL.
+// The ON CONFLICT predicate must include created_at (the partition key).
+const batchInsertPartitionedSQL = `
+INSERT INTO tickr_messages
+    (id, event_type, payload, headers, idempotency_key, status,
+     attempt, max_attempts, process_at, shard, created_at, updated_at)
+SELECT unnest($1::uuid[]),
+       unnest($2::text[]),
+       unnest($3::bytea[]),
+       unnest($4::jsonb[]),
+       nullif(unnest($5::text[]), ''),
+       'CREATED', 0,
+       unnest($6::int[]),
+       unnest($7::timestamptz[]),
+       unnest($8::smallint[]),
+       now(), now()
+ON CONFLICT (event_type, idempotency_key, created_at) WHERE idempotency_key IS NOT NULL
+    DO NOTHING
+RETURNING ` + messageReturnCols
+
+func (s *Store) batchInsertSQL() string {
+	if s.partitioned {
+		return batchInsertPartitionedSQL
+	}
+	return batchInsertSQL
+}
+
+// EnqueueBatch implements tickr.Storage. It inserts the whole batch in one
+// round-trip using unnest-based array parameters instead of N individual
+// statements, trading N parse/plan/WAL-record overhead for 1.
+//
+// Idempotency-duplicate handling: RETURNING only yields rows that were
+// actually inserted; skipped rows (ON CONFLICT DO NOTHING) are absent. We
+// correlate by the pre-generated UUID to detect which inputs were skipped,
+// then look up the existing row for any that had an idempotency key.
 func (s *Store) EnqueueBatch(ctx context.Context, tx tickr.Tx, ps []tickr.EnqueueParams) ([]*tickr.InboundMessage, error) {
 	if len(ps) == 0 {
 		return nil, nil
 	}
-	q := s.querier(tx)
-	batch := &pgx.Batch{}
-	for _, p := range ps {
-		id := newID()
-		processAt := p.ProcessAt
-		if processAt.IsZero() {
-			processAt = time.Now()
-		}
-		maxAttempts := p.MaxAttempts
-		if maxAttempts <= 0 {
-			maxAttempts = 10
-		}
-		var idemArg any
-		if p.IdempotencyKey != "" {
-			idemArg = p.IdempotencyKey
-		}
-		batch.Queue(s.insertSQL(),
-			id, p.EventType, p.Payload, encodeHeaders(p.Headers),
-			idemArg, maxAttempts, processAt, pickShard())
-	}
-	br := q.SendBatch(ctx, batch)
-	defer func() { _ = br.Close() }()
 
-	out := make([]*tickr.InboundMessage, 0, len(ps))
-	var firstErr error
+	// Build parallel typed slices — one element per input message.
+	ids := make([]uuid.UUID, len(ps))
+	eventTypes := make([]string, len(ps))
+	payloads := make([][]byte, len(ps))
+	hdrs := make([][]byte, len(ps))
+	idemKeys := make([]string, len(ps)) // empty string → nullif → NULL in DB
+	maxAttemptsList := make([]int, len(ps))
+	processAts := make([]time.Time, len(ps))
+	shards := make([]int16, len(ps))
+
+	now := time.Now()
 	for i, p := range ps {
-		row := br.QueryRow()
-		msg, err := scanMessage(row)
-		if err == nil {
-			out = append(out, msg)
+		ids[i] = newID()
+		eventTypes[i] = p.EventType
+		payloads[i] = p.Payload
+		hdrs[i] = encodeHeaders(p.Headers)
+		idemKeys[i] = p.IdempotencyKey
+		ma := p.MaxAttempts
+		if ma <= 0 {
+			ma = 10
+		}
+		maxAttemptsList[i] = ma
+		pa := p.ProcessAt
+		if pa.IsZero() {
+			pa = now
+		}
+		processAts[i] = pa
+		shards[i] = pickShard()
+	}
+
+	q := s.querier(tx)
+	rows, err := q.Query(ctx, s.batchInsertSQL(),
+		ids, eventTypes, payloads, hdrs, idemKeys,
+		maxAttemptsList, processAts, shards)
+	if err != nil {
+		return nil, fmt.Errorf("tickr/postgres: enqueue batch: %w", err)
+	}
+	defer rows.Close()
+
+	// Index inserted rows by their UUID so we can correlate with the input slice.
+	inserted := make(map[uuid.UUID]*tickr.InboundMessage, len(ps))
+	for rows.Next() {
+		msg, scanErr := scanMessage(rows)
+		if scanErr != nil {
+			return nil, fmt.Errorf("tickr/postgres: enqueue batch scan: %w", scanErr)
+		}
+		msgID, _ := uuid.Parse(string(msg.ID))
+		inserted[msgID] = msg
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("tickr/postgres: enqueue batch rows: %w", err)
+	}
+
+	// Reconstruct output in original input order.
+	// Rows absent from `inserted` were skipped by ON CONFLICT DO NOTHING.
+	out := make([]*tickr.InboundMessage, len(ps))
+	var firstDupErr error
+	for i, p := range ps {
+		if msg, ok := inserted[ids[i]]; ok {
+			out[i] = msg
 			continue
 		}
-		if !errors.Is(err, pgx.ErrNoRows) {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("tickr/postgres: enqueue batch item %d: %w", i, err)
-			}
-			out = append(out, nil)
-			continue
-		}
-		// Duplicate idempotency key for this row.
+		// Row was skipped — must have had an idempotency key conflict.
 		if p.IdempotencyKey == "" {
-			if firstErr == nil {
-				firstErr = fmt.Errorf("tickr/postgres: enqueue batch item %d: no rows but no idempotency key", i)
-			}
-			out = append(out, nil)
-			continue
+			// No idempotency key → conflict is impossible; this is a bug.
+			return out, fmt.Errorf("tickr/postgres: enqueue batch item %d: no rows returned but no idempotency key set", i)
 		}
-		// Defer the lookup until after we've drained the batch.
-		out = append(out, nil)
-	}
-	if err := br.Close(); err != nil && firstErr == nil {
-		firstErr = err
-	}
-	if firstErr != nil {
-		return out, firstErr
-	}
-	// Resolve duplicates (post-batch) so we can report ErrDuplicate.
-	var dupErr error
-	for i, p := range ps {
-		if out[i] != nil || p.IdempotencyKey == "" {
-			continue
-		}
-		existing, err := s.findByIdempotency(ctx, q, p.EventType, p.IdempotencyKey)
-		if err != nil {
-			return out, err
+		existing, lookupErr := s.findByIdempotency(ctx, q, p.EventType, p.IdempotencyKey)
+		if lookupErr != nil {
+			return out, lookupErr
 		}
 		out[i] = existing
-		if dupErr == nil {
-			dupErr = &tickr.ErrDuplicate{
+		if firstDupErr == nil {
+			firstDupErr = &tickr.ErrDuplicate{
 				ExistingID: existing.ID,
 				EventType:  p.EventType,
 				Key:        p.IdempotencyKey,
 			}
 		}
 	}
-	return out, dupErr
+
+	// Fire a single coalesced pg_notify for the whole batch. The listener
+	// treats notifications as a hint only (it re-polls after wakeup), so one
+	// signal is sufficient regardless of batch size. Previously EnqueueBatch
+	// sent no notification at all, silently breaking notify-based wakeup for
+	// batch producers.
+	if len(inserted) > 0 && !s.notifierDisabled {
+		// Any event type works as the payload — workers poll all registered types.
+		if nerr := s.notifyEnqueue(ctx, tx, ps[0].EventType); nerr != nil {
+			return out, nerr
+		}
+	}
+
+	return out, firstDupErr
 }
 
 // --- Claim ------------------------------------------------------------------
@@ -591,6 +676,57 @@ SET    status        = 'SUCCESS',
        completed_at  = now(),
        updated_at    = now()
 WHERE  id = $1 AND status = 'HANDLING' AND attempt = $2`
+
+// BatchSucceed implements tickr.BatchAcker. It commits all N message acks in
+// one explicit transaction (BEGIN; N×UPDATE [+CTE]; COMMIT) via pgx.SendBatch,
+// reducing WAL fsyncs from N to 1 regardless of batch size. This is the
+// primary lever for closing the drain throughput gap vs River (~6k+ msgs/sec).
+func (s *Store) BatchSucceed(ctx context.Context, params []tickr.BatchSucceedParam) error {
+	if len(params) == 0 {
+		return nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("tickr/postgres: batch succeed begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	batch := &pgx.Batch{}
+	if s.historyPolicy == HistoryOff {
+		for _, p := range params {
+			mid, parseErr := uuid.Parse(string(p.MessageID))
+			if parseErr != nil {
+				continue
+			}
+			batch.Queue(succeedNoHistorySQL, mid, p.Attempt)
+		}
+	} else {
+		for _, p := range params {
+			mid, parseErr := uuid.Parse(string(p.MessageID))
+			if parseErr != nil {
+				continue
+			}
+			batch.Queue(succeedSQL, mid, p.Attempt, p.WorkerID)
+		}
+	}
+
+	br := tx.SendBatch(ctx, batch)
+	for range params {
+		if _, execErr := br.Exec(); execErr != nil {
+			_ = br.Close()
+			return fmt.Errorf("tickr/postgres: batch succeed exec: %w", execErr)
+		}
+	}
+	if err := br.Close(); err != nil {
+		return fmt.Errorf("tickr/postgres: batch succeed close: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("tickr/postgres: batch succeed commit: %w", err)
+	}
+	return nil
+}
 
 // Succeed implements tickr.Storage.
 func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, workerID string) error {
@@ -809,24 +945,38 @@ func (s *Store) appendHistoryBatch(ctx context.Context, msgs []*tickr.InboundMes
 	if len(msgs) == 0 {
 		return nil
 	}
+
+	// Wrap the pgx.SendBatch in an explicit transaction so that all N INSERTs
+	// are flushed in one WAL fsync instead of N. History rows are advisory, so
+	// there is no correctness risk from atomically grouping them.
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("tickr/postgres: history batch begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
 	batch := &pgx.Batch{}
 	for _, m := range msgs {
-		mid, err := uuid.Parse(string(m.ID))
-		if err != nil {
+		mid, parseErr := uuid.Parse(string(m.ID))
+		if parseErr != nil {
 			continue
 		}
 		// from is implied (CREATED or RETRYING — we don't track which here;
 		// engine logs the prior status via msg.Attempt > 0 if needed).
 		batch.Queue(appendHistorySQL, mid, nil, string(to), m.Attempt, errStr, workerID)
 	}
-	br := s.pool.SendBatch(ctx, batch)
-	defer func() { _ = br.Close() }()
+
+	br := tx.SendBatch(ctx, batch)
 	for range msgs {
-		if _, err := br.Exec(); err != nil {
-			return err
+		if _, execErr := br.Exec(); execErr != nil {
+			_ = br.Close()
+			return execErr
 		}
 	}
-	return nil
+	if err := br.Close(); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 const historySQL = `

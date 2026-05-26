@@ -388,6 +388,33 @@ func appendHistory(ctx context.Context, ex execer, id tickr.MessageID, from, to 
 
 // --- Succeed / Fail / Release / Extend --------------------------------------
 
+// BatchSucceed implements tickr.BatchAcker. It wraps all N ack UPDATEs (and
+// optional history INSERTs) in one BeginTx/Commit, reducing WAL fsyncs from N
+// to 1 regardless of batch size. MySQL has no SendBatch equivalent, so the
+// statements execute sequentially inside the shared transaction.
+func (s *Store) BatchSucceed(ctx context.Context, params []tickr.BatchSucceedParam) error {
+	if len(params) == 0 {
+		return nil
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("tickr/mysql: batch succeed begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	for _, p := range params {
+		if _, execErr := tx.ExecContext(ctx, `
+            UPDATE tickr_messages
+            SET status='SUCCESS', completed_at=CURRENT_TIMESTAMP(6), updated_at=CURRENT_TIMESTAMP(6)
+            WHERE id=? AND status='HANDLING' AND attempt=?`,
+			string(p.MessageID), p.Attempt); execErr != nil {
+			return fmt.Errorf("tickr/mysql: batch succeed update: %w", execErr)
+		}
+		appendHistory(ctx, tx, p.MessageID, "HANDLING", "SUCCESS", p.Attempt, "", p.WorkerID)
+	}
+	return tx.Commit()
+}
+
 // Succeed implements tickr.Storage.
 func (s *Store) Succeed(ctx context.Context, id tickr.MessageID, attempt int, workerID string) error {
 	tx, err := s.db.BeginTx(ctx, nil)

@@ -44,17 +44,32 @@ type engine struct {
 	globalPool chan struct{}
 
 	stopping atomic.Bool
+
+	// succeedCh is non-nil when the storage implements BatchAcker.
+	// Handler goroutines post completed message params here instead of
+	// calling Succeed directly; ackFlusher batches them into one
+	// transaction per flush cycle (batchSize items or 5 ms tick).
+	succeedCh      chan BatchSucceedParam
+	ackFlusherDone chan struct{}
 }
 
 func newEngine(cfg engineConfig) *engine {
 	if cfg.poolSize <= 0 {
 		cfg.poolSize = 32
 	}
-	return &engine{
+	e := &engine{
 		cfg:             cfg,
 		perTypeInflight: map[string]chan struct{}{},
 		globalPool:      make(chan struct{}, cfg.poolSize),
 	}
+	if ba, ok := cfg.storage.(BatchAcker); ok {
+		// Buffer: up to 4× the claim batch so handler goroutines never
+		// block posting completions even during a slow flush.
+		e.succeedCh = make(chan BatchSucceedParam, batchSizeOrDefault(cfg.batchSize)*4)
+		e.ackFlusherDone = make(chan struct{})
+		go e.ackFlusher(ba)
+	}
+	return e
 }
 
 // run drives the claim loop until ctx is cancelled, then waits for in-flight
@@ -70,6 +85,11 @@ func (e *engine) run(ctx context.Context) error {
 	}
 
 	currentDelay := pollInterval
+	// Use a single reusable timer instead of time.After to avoid leaking
+	// goroutines during long backoff periods.
+	timer := time.NewTimer(currentDelay)
+	defer timer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -87,12 +107,19 @@ func (e *engine) run(ctx context.Context) error {
 			}
 		}
 
+		timer.Reset(currentDelay)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				<-timer.C
+			}
 			return e.drain()
-		case <-time.After(currentDelay):
+		case <-timer.C:
 		case <-e.cfg.notify:
 			// New work signalled — reset backoff and poll immediately.
+			if !timer.Stop() {
+				<-timer.C
+			}
 			currentDelay = pollInterval
 		}
 	}
@@ -106,7 +133,15 @@ func (e *engine) drain() error {
 	}
 	done := make(chan struct{})
 	go func() {
+		// Wait for all handler goroutines to post their completions.
+		// Because inflight.Done() is deferred after commitOutcome in each
+		// handler, every send to succeedCh is guaranteed to happen before
+		// inflight.Wait() returns — so it is safe to close the channel here.
 		e.inflight.Wait()
+		if e.succeedCh != nil {
+			close(e.succeedCh)
+			<-e.ackFlusherDone // wait for the final batch to be committed
+		}
 		close(done)
 	}()
 	select {
@@ -114,6 +149,56 @@ func (e *engine) drain() error {
 		return nil
 	case <-time.After(grace):
 		return fmt.Errorf("tickr: shutdown grace exceeded with in-flight handlers")
+	}
+}
+
+// ackFlusher collects BatchSucceedParam values from succeedCh and commits
+// them in batches — either when the buffer reaches batchSize or after a 5 ms
+// tick — whichever comes first. It exits when succeedCh is closed (by
+// drain(), after all handler goroutines have finished) and does a final flush
+// of any remaining items before returning.
+func (e *engine) ackFlusher(ba BatchAcker) {
+	defer close(e.ackFlusherDone)
+
+	const flushInterval = 5 * time.Millisecond
+	batchSize := batchSizeOrDefault(e.cfg.batchSize)
+	buf := make([]BatchSucceedParam, 0, batchSize)
+
+	flush := func() {
+		if len(buf) == 0 {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		if err := ba.BatchSucceed(ctx, buf); err != nil {
+			e.cfg.logger.Error(ctx, "tickr: batch succeed failed", err)
+			fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
+				Kind: ErrorKindStorage,
+				Err:  err,
+			})
+		}
+		buf = buf[:0]
+	}
+
+	ticker := time.NewTicker(flushInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case p, ok := <-e.succeedCh:
+			if !ok {
+				// Channel closed — drain() has confirmed all handlers are done.
+				// Flush any buffered params and exit.
+				flush()
+				return
+			}
+			buf = append(buf, p)
+			if len(buf) >= batchSize {
+				flush()
+			}
+		case <-ticker.C:
+			flush()
+		}
 	}
 }
 
@@ -450,6 +535,19 @@ func (e *engine) resolveOutcome(parentCtx context.Context, err error) Outcome {
 func (e *engine) commitOutcome(ctx context.Context, m *InboundMessage, cfg handlerConfig, err error, outcome Outcome) {
 	switch outcome {
 	case OutcomeSuccess:
+		if e.succeedCh != nil {
+			// Post to the flusher; it holds the blocking send so the handler
+			// goroutine is unblocked as soon as the channel has room. The
+			// channel is sized to 4× batchSize so this is almost never the
+			// slow path. A blocking send here is intentional: it keeps
+			// back-pressure on the handler pool when the flusher falls behind.
+			e.succeedCh <- BatchSucceedParam{
+				MessageID: m.ID,
+				Attempt:   m.Attempt,
+				WorkerID:  e.cfg.workerID,
+			}
+			return
+		}
 		if serr := e.cfg.storage.Succeed(ctx, m.ID, m.Attempt, e.cfg.workerID); serr != nil {
 			e.cfg.logger.Error(ctx, "tickr: succeed failed", serr, "message_id", m.ID)
 			fireAlert(e.cfg.alerter, e.cfg.logger, ctx, ErrorEvent{
